@@ -1,0 +1,32 @@
+{
+  "34a95a5ced99d97e384dd003247d8cb3": {
+    "symbol": "AAPL",
+    "source": "yahoo",
+    "timeframe": "1d",
+    "start_date": "2023-01-01",
+    "end_date": "2024-01-01",
+    "asset_type": "equity",
+    "fetch_timestamp": "2025-10-02T20:36:57.778410",
+    "num_rows": 250
+  },
+  "3f84354802a061681ccbc7f2e9d1017b": {
+    "symbol": "MSFT",
+    "source": "yahoo",
+    "timeframe": "1d",
+    "start_date": "2023-01-01",
+    "end_date": "2024-01-01",
+    "asset_type": "equity",
+    "fetch_timestamp": "2025-10-02T20:36:58.147067",
+    "num_rows": 250
+  },
+  "51b63019c69f832d2ee227a3fd59466f": {
+    "symbol": "GOOGL",
+    "source": "yahoo",
+    "timeframe": "1d",
+    "start_date": "2023-01-01",
+    "end_date": "2024-01-01",
+    "asset_type": "equity",
+    "fetch_timestamp": "2025-10-02T20:36:58.460948",
+    "num_rows": 250
+  }
+}
