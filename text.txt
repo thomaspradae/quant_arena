@@ -1,0 +1,4158 @@
+
+"""
+Data Manager v1: Handles data fetching, caching, and retrieval
+Supports Yahoo Finance and Alpaca with Parquet caching
+"""
+
+import os
+import json
+import hashlib
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+import pandas as pd
+import numpy as np
+
+# Data source imports
+import yfinance as yf
+
+# Optional: Alpaca (install with: pip install alpaca-trade-api)
+try:
+    from alpaca.data.historical import StockHistoricalDataClient, CryptoHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest, CryptoBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+    ALPACA_AVAILABLE = True
+except ImportError:
+    ALPACA_AVAILABLE = False
+
+
+# ============================================================================
+# DATA MANAGER
+# ============================================================================
+
+class DataManager:
+    """
+    Centralized data fetching, caching, and retrieval system.
+    
+    Features:
+    - Multi-source support (Yahoo Finance, Alpaca)
+    - Automatic local caching (Parquet format)
+    - Metadata tracking (JSON)
+    - Incremental updates
+    - Data quality validation
+    """
+    
+    def __init__(self, cache_dir: str = './data_cache', alpaca_api_key: Optional[str] = None, 
+                 alpaca_secret_key: Optional[str] = None):
+        """
+        Initialize DataManager.
+        
+        Args:
+            cache_dir: Directory for storing cached data
+            alpaca_api_key: Alpaca API key (optional)
+            alpaca_secret_key: Alpaca secret key (optional)
+        """
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create subdirectories
+        self.data_dir = self.cache_dir / 'data'
+        self.metadata_dir = self.cache_dir / 'metadata'
+        self.data_dir.mkdir(exist_ok=True)
+        self.metadata_dir.mkdir(exist_ok=True)
+        
+        # Load metadata database
+        self.metadata_file = self.metadata_dir / 'metadata.json'
+        self.metadata_db = self._load_metadata()
+        
+        # Initialize API clients
+        self.alpaca_stock_client = None
+        self.alpaca_crypto_client = None
+        if ALPACA_AVAILABLE and alpaca_api_key and alpaca_secret_key:
+            self.alpaca_stock_client = StockHistoricalDataClient(alpaca_api_key, alpaca_secret_key)
+            self.alpaca_crypto_client = CryptoHistoricalDataClient(alpaca_api_key, alpaca_secret_key)
+    
+    # ========================================================================
+    # PUBLIC API
+    # ========================================================================
+    
+    def fetch_data(
+        self,
+        symbol: str,
+        source: str = 'yahoo',
+        timeframe: str = '1d',
+        start_date: str = '2020-01-01',
+        end_date: Optional[str] = None,
+        asset_type: str = 'equity',
+        force_refresh: bool = False
+    ) -> pd.DataFrame:
+        """
+        Fetch data from source or cache.
+        
+        Args:
+            symbol: Ticker symbol (e.g., 'AAPL', 'BTC-USD')
+            source: Data source ('yahoo', 'alpaca')
+            timeframe: Bar size ('1min', '5min', '15min', '1h', '1d')
+            start_date: Start date (YYYY-MM-DD)
+            end_date: End date (YYYY-MM-DD), defaults to today
+            asset_type: Asset class ('equity', 'crypto', 'futures')
+            force_refresh: Force re-download even if cached
+        
+        Returns:
+            DataFrame with OHLCV data (datetime index)
+        """
+        if end_date is None:
+            end_date = datetime.now().strftime('%Y-%m-%d')
+        
+        # Generate cache key
+        cache_key = self._generate_cache_key(symbol, source, timeframe, start_date, end_date)
+        
+        # Check cache
+        if not force_refresh and self._is_cached(cache_key):
+            print(f"Loading {symbol} from cache...")
+            data = self._load_from_cache(cache_key)
+            
+            # Validate cached data
+            if self._validate_data(data):
+                return data
+            else:
+                print(f"Cached data invalid, re-fetching...")
+        
+        # Fetch from source
+        print(f"Fetching {symbol} from {source}...")
+        data = self._fetch_from_source(symbol, source, timeframe, start_date, end_date, asset_type)
+        
+        # Validate fetched data
+        if not self._validate_data(data):
+            raise ValueError(f"Invalid data received for {symbol}")
+        
+        # Cache it
+        self._save_to_cache(cache_key, data, metadata={
+            'symbol': symbol,
+            'source': source,
+            'timeframe': timeframe,
+            'start_date': start_date,
+            'end_date': end_date,
+            'asset_type': asset_type,
+            'fetch_timestamp': datetime.now().isoformat(),
+            'num_rows': len(data)
+        })
+        
+        return data
+    
+    def get_available_symbols(self, source: Optional[str] = None, 
+                            asset_type: Optional[str] = None) -> List[str]:
+        """Get list of cached symbols, optionally filtered."""
+        symbols = set()
+        for key, meta in self.metadata_db.items():
+            if source and meta['source'] != source:
+                continue
+            if asset_type and meta['asset_type'] != asset_type:
+                continue
+            symbols.add(meta['symbol'])
+        return sorted(list(symbols))
+    
+    def get_date_range(self, symbol: str, source: str = 'yahoo', 
+                      timeframe: str = '1d') -> Optional[Tuple[str, str]]:
+        """Get available date range for a symbol from cache."""
+        for key, meta in self.metadata_db.items():
+            if (meta['symbol'] == symbol and 
+                meta['source'] == source and 
+                meta['timeframe'] == timeframe):
+                return (meta['start_date'], meta['end_date'])
+        return None
+    
+    def clear_cache(self, symbol: Optional[str] = None):
+        """Clear cache (all or specific symbol)."""
+        if symbol is None:
+            # Clear all
+            for f in self.data_dir.glob('*.parquet'):
+                f.unlink()
+            self.metadata_db = {}
+            self._save_metadata()
+            print("All cache cleared")
+        else:
+            # Clear specific symbol
+            keys_to_remove = [k for k, v in self.metadata_db.items() if v['symbol'] == symbol]
+            for key in keys_to_remove:
+                cache_file = self.data_dir / f"{key}.parquet"
+                if cache_file.exists():
+                    cache_file.unlink()
+                del self.metadata_db[key]
+            self._save_metadata()
+            print(f"Cache cleared for {symbol}")
+    
+    # ========================================================================
+    # CACHING
+    # ========================================================================
+    
+    def _generate_cache_key(self, symbol: str, source: str, timeframe: str, 
+                           start_date: str, end_date: str) -> str:
+        """Generate unique cache key (hash to avoid filesystem issues)."""
+        key_string = f"{symbol}_{source}_{timeframe}_{start_date}_{end_date}"
+        return hashlib.md5(key_string.encode()).hexdigest()
+    
+    def _is_cached(self, cache_key: str) -> bool:
+        """Check if data is cached."""
+        cache_file = self.data_dir / f"{cache_key}.parquet"
+        return cache_file.exists() and cache_key in self.metadata_db
+    
+    def _load_from_cache(self, cache_key: str) -> pd.DataFrame:
+        """Load data from Parquet cache."""
+        cache_file = self.data_dir / f"{cache_key}.parquet"
+        df = pd.read_parquet(cache_file)
+        df.index = pd.to_datetime(df.index)
+        return df
+    
+    def _save_to_cache(self, cache_key: str, data: pd.DataFrame, metadata: Dict):
+        """Save data to Parquet cache with metadata."""
+        # Save data
+        cache_file = self.data_dir / f"{cache_key}.parquet"
+        data.to_parquet(cache_file, compression='snappy')
+        
+        # Update metadata
+        self.metadata_db[cache_key] = metadata
+        self._save_metadata()
+    
+    def _load_metadata(self) -> Dict:
+        """Load metadata database from JSON."""
+        if self.metadata_file.exists():
+            with open(self.metadata_file, 'r') as f:
+                return json.load(f)
+        return {}
+    
+    def _save_metadata(self):
+        """Save metadata database to JSON."""
+        with open(self.metadata_file, 'w') as f:
+            json.dump(self.metadata_db, f, indent=2)
+    
+    # ========================================================================
+    # DATA FETCHING
+    # ========================================================================
+    
+    def _fetch_from_source(self, symbol: str, source: str, timeframe: str,
+                          start_date: str, end_date: str, asset_type: str) -> pd.DataFrame:
+        """Dispatch to appropriate data source."""
+        if source == 'yahoo':
+            return self._fetch_yahoo(symbol, timeframe, start_date, end_date)
+        elif source == 'alpaca':
+            return self._fetch_alpaca(symbol, timeframe, start_date, end_date, asset_type)
+        else:
+            raise ValueError(f"Unknown data source: {source}")
+    
+    def _fetch_yahoo(self, symbol: str, timeframe: str, start_date: str, 
+                    end_date: str) -> pd.DataFrame:
+        """Fetch data from Yahoo Finance."""
+        # Map timeframe to yfinance interval
+        interval_map = {
+            '1min': '1m',
+            '2min': '2m',
+            '5min': '5m',
+            '15min': '15m',
+            '30min': '30m',
+            '1h': '1h',
+            '1d': '1d',
+            '1wk': '1wk',
+            '1mo': '1mo'
+        }
+        interval = interval_map.get(timeframe, '1d')
+        
+        # Download data
+        ticker = yf.Ticker(symbol)
+        df = ticker.history(start=start_date, end=end_date, interval=interval)
+        
+        if df.empty:
+            raise ValueError(f"No data returned for {symbol}")
+        
+        # Standardize column names (lowercase)
+        df.columns = [col.lower() for col in df.columns]
+        
+        # Ensure we have required columns
+        required = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in df.columns for col in required):
+            raise ValueError(f"Missing required columns for {symbol}")
+        
+        return df
+    
+    def _fetch_alpaca(self, symbol: str, timeframe: str, start_date: str,
+                     end_date: str, asset_type: str) -> pd.DataFrame:
+        """Fetch data from Alpaca."""
+        if not ALPACA_AVAILABLE:
+            raise ImportError("Alpaca not installed. Install with: pip install alpaca-trade-api")
+        
+        if not self.alpaca_stock_client:
+            raise ValueError("Alpaca credentials not provided")
+        
+        # Map timeframe to Alpaca TimeFrame
+        tf_map = {
+            '1min': TimeFrame(1, TimeFrameUnit.Minute),
+            '5min': TimeFrame(5, TimeFrameUnit.Minute),
+            '15min': TimeFrame(15, TimeFrameUnit.Minute),
+            '1h': TimeFrame(1, TimeFrameUnit.Hour),
+            '1d': TimeFrame(1, TimeFrameUnit.Day),
+        }
+        alpaca_tf = tf_map.get(timeframe)
+        if not alpaca_tf:
+            raise ValueError(f"Unsupported timeframe for Alpaca: {timeframe}")
+        
+        # Fetch based on asset type
+        if asset_type == 'equity':
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=alpaca_tf,
+                start=start_date,
+                end=end_date
+            )
+            bars = self.alpaca_stock_client.get_stock_bars(request)
+        elif asset_type == 'crypto':
+            request = CryptoBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=alpaca_tf,
+                start=start_date,
+                end=end_date
+            )
+            bars = self.alpaca_crypto_client.get_crypto_bars(request)
+        else:
+            raise ValueError(f"Unsupported asset_type for Alpaca: {asset_type}")
+        
+        # Convert to DataFrame
+        df = bars.df
+        
+        if df.empty:
+            raise ValueError(f"No data returned for {symbol}")
+        
+        # Reset index if multi-index
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index(level=0, drop=True)
+        
+        # Standardize column names
+        df.columns = [col.lower() for col in df.columns]
+        
+        return df
+    
+    # ========================================================================
+    # DATA VALIDATION
+    # ========================================================================
+    
+    def _validate_data(self, data: pd.DataFrame) -> bool:
+        """Validate data quality."""
+        if data.empty:
+            return False
+        
+        # Check for required columns
+        required = ['open', 'high', 'low', 'close', 'volume']
+        if not all(col in data.columns for col in required):
+            return False
+        
+        # Check for NaN in critical columns
+        critical_cols = ['close']
+        if data[critical_cols].isnull().any().any():
+            print("Warning: NaN values in critical columns")
+            return False
+        
+        # Check for negative prices
+        price_cols = ['open', 'high', 'low', 'close']
+        if (data[price_cols] < 0).any().any():
+            print("Warning: Negative prices detected")
+            return False
+        
+        # Check high >= low
+        if (data['high'] < data['low']).any():
+            print("Warning: High < Low detected")
+            return False
+        
+        # Check for duplicated timestamps
+        if data.index.duplicated().any():
+            print("Warning: Duplicated timestamps detected")
+            return False
+        
+        return True
+    
+    # ========================================================================
+    # UTILITY METHODS
+    # ========================================================================
+    
+    def get_cache_stats(self) -> Dict:
+        """Get cache statistics."""
+        total_files = len(list(self.data_dir.glob('*.parquet')))
+        total_size = sum(f.stat().st_size for f in self.data_dir.glob('*.parquet'))
+        
+        return {
+            'total_symbols': len(set(m['symbol'] for m in self.metadata_db.values())),
+            'total_cached_series': total_files,
+            'cache_size_mb': total_size / (1024 * 1024),
+            'cache_directory': str(self.cache_dir)
+        }
+    
+    def __repr__(self):
+        stats = self.get_cache_stats()
+        return (f"DataManager(symbols={stats['total_symbols']}, "
+                f"cached={stats['total_cached_series']}, "
+                f"size={stats['cache_size_mb']:.2f}MB)")
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Initialize DataManager
+    dm = DataManager(cache_dir='./data_cache')
+    
+    print("="*60)
+    print("Data Manager v1 - Example Usage")
+    print("="*60)
+    
+    # Fetch some data
+    symbols = ['AAPL', 'MSFT', 'GOOGL']
+    
+    for symbol in symbols:
+        try:
+            df = dm.fetch_data(
+                symbol=symbol,
+                source='yahoo',
+                timeframe='1d',
+                start_date='2023-01-01',
+                end_date='2024-01-01',
+                asset_type='equity'
+            )
+            print(f"\n{symbol}: {len(df)} bars")
+            print(f"Date range: {df.index[0]} to {df.index[-1]}")
+            print(f"Columns: {list(df.columns)}")
+        except Exception as e:
+            print(f"\nError fetching {symbol}: {e}")
+    
+    # Show cache stats
+    print("\n" + "="*60)
+    print("Cache Statistics:")
+    print("="*60)
+    print(dm)
+    stats = dm.get_cache_stats()
+    for key, value in stats.items():
+        print(f"  {key}: {value}")
+    
+    # Show available symbols
+    print("\n" + "="*60)
+    print("Available Symbols:")
+    print("="*60)
+    available = dm.get_available_symbols()
+    print(f"  {available}")
+    
+    # Test cache hit
+    print("\n" + "="*60)
+    print("Testing Cache Hit:")
+    print("="*60)
+    df = dm.fetch_data(
+        symbol='AAPL',
+        source='yahoo',
+        timeframe='1d',
+        start_date='2023-01-01',
+        end_date='2024-01-01'
+    )
+    print(f"AAPL loaded from cache: {len(df)} bars")
+
+i think that's yeah one year, and that's daily, then why the fuck are we getting 4 matches lmao
+
+we should have one match per day 
+
+"""
+Matchmaker v1: Strategy pairing system for head-to-head comparisons
+"""
+
+from abc import ABC, abstractmethod
+from typing import List, Tuple, Dict, Optional, Set
+import pandas as pd
+import numpy as np
+from itertools import combinations
+from dataclasses import dataclass
+import random
+
+
+# ============================================================================
+# MATCHUP DATA STRUCTURE
+# ============================================================================
+
+@dataclass
+class Matchup:
+    """Represents a head-to-head comparison between two strategies"""
+    strategy_a: any  # Strategy instance
+    strategy_b: any  # Strategy instance
+    regime: Optional[str] = None
+    asset: Optional[str] = None
+    timeframe: Optional[str] = None
+    date_range: Optional[Tuple[pd.Timestamp, pd.Timestamp]] = None
+    
+    def __repr__(self):
+        regime_str = f"[{self.regime}]" if self.regime else ""
+        return f"{self.strategy_a.name} vs {self.strategy_b.name} {regime_str}"
+    
+    def get_key(self) -> str:
+        """Unique identifier for this matchup"""
+        parts = [
+            self.strategy_a.name,
+            self.strategy_b.name,
+            str(self.regime) if self.regime else "all",
+            str(self.asset) if self.asset else "all",
+            str(self.timeframe) if self.timeframe else "all"
+        ]
+        return "_".join(parts)
+
+
+# ============================================================================
+# BASE MATCHMAKER
+# ============================================================================
+
+class MatchMaker(ABC):
+    """Base class for strategy matchmaking"""
+    
+    def __init__(self):
+        self.match_history: List[Matchup] = []
+    
+    @abstractmethod
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """
+        Generate list of strategy matchups.
+        
+        Args:
+            strategies: List of Strategy instances
+            data: Price/volume data
+            regimes: Optional regime labels
+            asset: Optional asset identifier
+            timeframe: Optional timeframe identifier
+        
+        Returns:
+            List of Matchup objects
+        """
+        pass
+    
+    def get_match_count(self) -> int:
+        """Total number of matches generated"""
+        return len(self.match_history)
+    
+    def clear_history(self):
+        """Clear match history"""
+        self.match_history = []
+
+
+# ============================================================================
+# ROUND ROBIN MATCHMAKER
+# ============================================================================
+
+class RoundRobinMatcher(MatchMaker):
+    """
+    Everyone vs everyone - exhaustive pairwise comparisons.
+    Good for small strategy universes (<20 strategies).
+    """
+    
+    def __init__(self, include_global: bool = True):
+        """
+        Args:
+            include_global: If True, also create matchups with regime=None (overall)
+        """
+        super().__init__()
+        self.include_global = include_global
+    
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate all possible pairwise matchups"""
+        
+        matchups = []
+        
+        # Get all strategy pairs
+        strategy_pairs = list(combinations(strategies, 2))
+        
+        if regimes is not None:
+            # Create matchups per regime
+            unique_regimes = regimes.unique()
+            
+            for strat_a, strat_b in strategy_pairs:
+                for regime in unique_regimes:
+                    matchups.append(Matchup(
+                        strategy_a=strat_a,
+                        strategy_b=strat_b,
+                        regime=regime,
+                        asset=asset,
+                        timeframe=timeframe
+                    ))
+            
+            # Also add global matchups (across all regimes)
+            if self.include_global:
+                for strat_a, strat_b in strategy_pairs:
+                    matchups.append(Matchup(
+                        strategy_a=strat_a,
+                        strategy_b=strat_b,
+                        regime=None,
+                        asset=asset,
+                        timeframe=timeframe
+                    ))
+        else:
+            # No regimes - just create pairs
+            for strat_a, strat_b in strategy_pairs:
+                matchups.append(Matchup(
+                    strategy_a=strat_a,
+                    strategy_b=strat_b,
+                    regime=None,
+                    asset=asset,
+                    timeframe=timeframe
+                ))
+        
+        self.match_history.extend(matchups)
+        return matchups
+    
+    def estimate_match_count(self, num_strategies: int, num_regimes: int = 1) -> int:
+        """Estimate total matches before generating"""
+        pairs = (num_strategies * (num_strategies - 1)) // 2
+        
+        if self.include_global and num_regimes > 1:
+            return pairs * (num_regimes + 1)
+        else:
+            return pairs * num_regimes
+
+
+# ============================================================================
+# RANDOM SAMPLING MATCHMAKER
+# ============================================================================
+
+class RandomSamplingMatcher(MatchMaker):
+    """
+    Randomly sample strategy pairs.
+    Good when universe is large and we want a representative sample.
+    """
+    
+    def __init__(self, num_matches: int = 100, seed: Optional[int] = None):
+        """
+        Args:
+            num_matches: Number of random matchups to generate
+            seed: Random seed for reproducibility
+        """
+        super().__init__()
+        self.num_matches = num_matches
+        self.seed = seed
+        if seed is not None:
+            random.seed(seed)
+            np.random.seed(seed)
+    
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate random sample of matchups"""
+        
+        matchups = []
+        
+        if len(strategies) < 2:
+            return matchups
+        
+        # Determine regimes
+        if regimes is not None:
+            regime_list = list(regimes.unique()) + [None]  # Include global
+        else:
+            regime_list = [None]
+        
+        # Generate random matchups
+        for _ in range(self.num_matches):
+            # Random strategy pair (without replacement)
+            strat_a, strat_b = random.sample(strategies, 2)
+            
+            # Random regime
+            regime = random.choice(regime_list)
+            
+            matchups.append(Matchup(
+                strategy_a=strat_a,
+                strategy_b=strat_b,
+                regime=regime,
+                asset=asset,
+                timeframe=timeframe
+            ))
+        
+        self.match_history.extend(matchups)
+        return matchups
+
+
+# ============================================================================
+# TOURNAMENT MATCHMAKER
+# ============================================================================
+
+class TournamentMatcher(MatchMaker):
+    """
+    Single-elimination or double-elimination tournament bracket.
+    Good for identifying top strategies quickly.
+    """
+    
+    def __init__(self, style: str = 'single'):
+        """
+        Args:
+            style: 'single' or 'double' elimination
+        """
+        super().__init__()
+        if style not in ['single', 'double']:
+            raise ValueError("style must be 'single' or 'double'")
+        self.style = style
+    
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate first round of tournament matchups"""
+        
+        # Shuffle strategies for random seeding
+        shuffled = strategies.copy()
+        random.shuffle(shuffled)
+        
+        # Pair them up
+        matchups = []
+        for i in range(0, len(shuffled) - 1, 2):
+            matchups.append(Matchup(
+                strategy_a=shuffled[i],
+                strategy_b=shuffled[i + 1],
+                regime=None,  # Tournament uses overall performance
+                asset=asset,
+                timeframe=timeframe
+            ))
+        
+        # If odd number, one strategy gets a bye (auto-advance)
+        if len(shuffled) % 2 == 1:
+            print(f"Strategy {shuffled[-1].name} gets a bye to next round")
+        
+        self.match_history.extend(matchups)
+        return matchups
+    
+    def generate_next_round(
+        self,
+        winners: List,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate next round based on winners from previous round"""
+        
+        if len(winners) <= 1:
+            return []  # Tournament over
+        
+        matchups = []
+        for i in range(0, len(winners) - 1, 2):
+            matchups.append(Matchup(
+                strategy_a=winners[i],
+                strategy_b=winners[i + 1],
+                regime=None,
+                asset=asset,
+                timeframe=timeframe
+            ))
+        
+        # Handle odd number
+        if len(winners) % 2 == 1:
+            print(f"Strategy {winners[-1].name} gets a bye to next round")
+        
+        self.match_history.extend(matchups)
+        return matchups
+
+
+# ============================================================================
+# SWISS SYSTEM MATCHMAKER
+# ============================================================================
+
+class SwissSystemMatcher(MatchMaker):
+    """
+    Swiss tournament system - pair strategies with similar records.
+    Good for finding relative rankings without full round-robin.
+    """
+    
+    def __init__(self, num_rounds: int = 5):
+        """
+        Args:
+            num_rounds: Number of rounds to play
+        """
+        super().__init__()
+        self.num_rounds = num_rounds
+        self.strategy_records: Dict[str, Dict] = {}  # Track wins/losses
+    
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate first round (random pairings)"""
+        
+        # Initialize records
+        for strat in strategies:
+            if strat.name not in self.strategy_records:
+                self.strategy_records[strat.name] = {
+                    'wins': 0,
+                    'losses': 0,
+                    'opponents': set()
+                }
+        
+        # First round is random
+        shuffled = strategies.copy()
+        random.shuffle(shuffled)
+        
+        matchups = []
+        for i in range(0, len(shuffled) - 1, 2):
+            matchups.append(Matchup(
+                strategy_a=shuffled[i],
+                strategy_b=shuffled[i + 1],
+                regime=None,
+                asset=asset,
+                timeframe=timeframe
+            ))
+        
+        self.match_history.extend(matchups)
+        return matchups
+    
+    def update_records(self, winner_name: str, loser_name: str):
+        """Update win/loss records after a match"""
+        self.strategy_records[winner_name]['wins'] += 1
+        self.strategy_records[winner_name]['opponents'].add(loser_name)
+        
+        self.strategy_records[loser_name]['losses'] += 1
+        self.strategy_records[loser_name]['opponents'].add(winner_name)
+    
+    def generate_next_round(
+        self,
+        strategies: List,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate next round by pairing similar records"""
+        
+        # Sort by record (wins - losses)
+        sorted_strats = sorted(
+            strategies,
+            key=lambda s: self.strategy_records[s.name]['wins'] - 
+                         self.strategy_records[s.name]['losses'],
+            reverse=True
+        )
+        
+        matchups = []
+        used = set()
+        
+        # Pair adjacent strategies in standings who haven't played yet
+        for i, strat_a in enumerate(sorted_strats):
+            if strat_a.name in used:
+                continue
+            
+            # Find best opponent (similar record, haven't played)
+            for j in range(i + 1, len(sorted_strats)):
+                strat_b = sorted_strats[j]
+                
+                if strat_b.name in used:
+                    continue
+                
+                # Check if they've played before
+                if strat_b.name not in self.strategy_records[strat_a.name]['opponents']:
+                    matchups.append(Matchup(
+                        strategy_a=strat_a,
+                        strategy_b=strat_b,
+                        regime=None,
+                        asset=asset,
+                        timeframe=timeframe
+                    ))
+                    used.add(strat_a.name)
+                    used.add(strat_b.name)
+                    break
+        
+        self.match_history.extend(matchups)
+        return matchups
+
+
+# ============================================================================
+# ADAPTIVE MATCHMAKER
+# ============================================================================
+
+class AdaptiveMatcher(MatchMaker):
+    """
+    Prioritizes matchups that will be most informative.
+    Focuses on close-skill matchups and under-tested pairs.
+    """
+    
+    def __init__(self, budget: int = 100):
+        """
+        Args:
+            budget: Maximum number of matchups to generate
+        """
+        super().__init__()
+        self.budget = budget
+        self.matchup_counts: Dict[str, int] = {}  # Track how often pairs are tested
+    
+    def generate_matchups(
+        self,
+        strategies: List,
+        data: pd.DataFrame,
+        regimes: Optional[pd.Series] = None,
+        asset: Optional[str] = None,
+        timeframe: Optional[str] = None
+    ) -> List[Matchup]:
+        """Generate matchups prioritizing informative comparisons"""
+        
+        matchups = []
+        
+        # Get all possible pairs
+        all_pairs = list(combinations(strategies, 2))
+        
+        # Score each pair by informativeness
+        pair_scores = []
+        for strat_a, strat_b in all_pairs:
+            pair_key = f"{strat_a.name}_{strat_b.name}"
+            
+            # Penalize pairs we've already tested a lot
+            test_count = self.matchup_counts.get(pair_key, 0)
+            
+            # Reward pairs with similar characteristics (harder to predict winner)
+            similarity = self._calculate_similarity(strat_a, strat_b)
+            
+            # Score = similarity / (1 + test_count)
+            score = similarity / (1 + test_count)
+            pair_scores.append((score, strat_a, strat_b))
+        
+        # Sort by score (highest first) and take top budget
+        pair_scores.sort(reverse=True, key=lambda x: x[0])
+        
+        regimes_to_test = [None]
+        if regimes is not None:
+            regimes_to_test.extend(regimes.unique())
+        
+        # Generate matchups from top-scored pairs
+        matches_per_regime = self.budget // len(regimes_to_test)
+        
+        for regime in regimes_to_test:
+            for i in range(min(matches_per_regime, len(pair_scores))):
+                _, strat_a, strat_b = pair_scores[i]
+                
+                matchup = Matchup(
+                    strategy_a=strat_a,
+                    strategy_b=strat_b,
+                    regime=regime,
+                    asset=asset,
+                    timeframe=timeframe
+                )
+                matchups.append(matchup)
+                
+                # Update count
+                pair_key = f"{strat_a.name}_{strat_b.name}"
+                self.matchup_counts[pair_key] = self.matchup_counts.get(pair_key, 0) + 1
+        
+        self.match_history.extend(matchups)
+        return matchups
+    
+    def _calculate_similarity(self, strat_a, strat_b) -> float:
+        """
+        Calculate similarity between two strategies.
+        Higher similarity = harder to predict winner = more informative.
+        """
+        # Simple heuristic: same type = more similar
+        type_match = 1.0 if strat_a.strategy_type == strat_b.strategy_type else 0.5
+        
+        # Could extend with more sophisticated similarity metrics
+        return type_match
+
+
+# ============================================================================
+# MATCHMAKER REGISTRY
+# ============================================================================
+
+class MatchMakerRegistry:
+    """Central registry for matchmaker strategies"""
+    
+    def __init__(self):
+        self.matchmakers: Dict[str, MatchMaker] = {}
+    
+    def register(self, name: str, matchmaker: MatchMaker):
+        """Register a matchmaker"""
+        self.matchmakers[name] = matchmaker
+    
+    def get(self, name: str) -> Optional[MatchMaker]:
+        """Get matchmaker by name"""
+        return self.matchmakers.get(name)
+    
+    def list_all(self) -> List[str]:
+        """List all registered matchmakers"""
+        return list(self.matchmakers.keys())
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    print("="*60)
+    print("Matchmaker v1 - Example Usage")
+    print("="*60)
+    
+    # Create dummy strategies
+    class DummyStrategy:
+        def __init__(self, name, strat_type):
+            self.name = name
+            self.strategy_type = strat_type
+    
+    strategies = [
+        DummyStrategy("SMA_Fast", "momentum"),
+        DummyStrategy("SMA_Slow", "momentum"),
+        DummyStrategy("BollingerMR", "mean_reversion"),
+        DummyStrategy("RSI", "momentum"),
+        DummyStrategy("BuyHold", "passive"),
+    ]
+    
+    # Dummy data
+    dates = pd.date_range('2020-01-01', periods=100, freq='D')
+    data = pd.DataFrame({'close': np.random.randn(100).cumsum() + 100}, index=dates)
+    regimes = pd.Series(np.random.choice([0, 1], 100), index=dates)
+    
+    print(f"\nTesting with {len(strategies)} strategies")
+    
+    # Test Round Robin
+    print("\n" + "-"*60)
+    print("1. Round Robin Matcher")
+    print("-"*60)
+    rr = RoundRobinMatcher(include_global=True)
+    matchups = rr.generate_matchups(strategies, data, regimes)
+    print(f"Generated {len(matchups)} matchups")
+    print(f"Expected: {rr.estimate_match_count(len(strategies), 2)}")
+    print(f"Sample: {matchups[0]}")
+    
+    # Test Random Sampling
+    print("\n" + "-"*60)
+    print("2. Random Sampling Matcher")
+    print("-"*60)
+    rs = RandomSamplingMatcher(num_matches=20, seed=42)
+    matchups = rs.generate_matchups(strategies, data, regimes)
+    print(f"Generated {len(matchups)} random matchups")
+    print(f"Samples:")
+    for m in matchups[:3]:
+        print(f"  {m}")
+    
+    # Test Tournament
+    print("\n" + "-"*60)
+    print("3. Tournament Matcher")
+    print("-"*60)
+    tm = TournamentMatcher(style='single')
+    matchups = tm.generate_matchups(strategies, data)
+    print(f"Round 1: {len(matchups)} matchups")
+    for m in matchups:
+        print(f"  {m}")
+    
+    # Test Swiss System
+    print("\n" + "-"*60)
+    print("4. Swiss System Matcher")
+    print("-"*60)
+    swiss = SwissSystemMatcher(num_rounds=3)
+    matchups = swiss.generate_matchups(strategies, data)
+    print(f"Round 1: {len(matchups)} matchups")
+    
+    # Simulate some results and generate round 2
+    swiss.update_records(strategies[0].name, strategies[1].name)
+    swiss.update_records(strategies[2].name, strategies[3].name)
+    
+    matchups_r2 = swiss.generate_next_round(strategies)
+    print(f"Round 2: {len(matchups_r2)} matchups")
+    for m in matchups_r2:
+        print(f"  {m}")
+    
+    # Test Adaptive
+    print("\n" + "-"*60)
+    print("5. Adaptive Matcher")
+    print("-"*60)
+    adaptive = AdaptiveMatcher(budget=10)
+    matchups = adaptive.generate_matchups(strategies, data, regimes)
+    print(f"Generated {len(matchups)} adaptive matchups")
+    print("Top matchups:")
+    for m in matchups[:5]:
+        print(f"  {m}")
+    
+    print("\n" + "="*60)
+    print("Matchmaking Complete!")
+    print("="*60)
+
+"""
+Ranking System v1: ELO, TrueSkill, and Bradley-Terry rankings for strategies
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, List, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
+import pandas as pd
+import numpy as np
+import math
+
+# Optional: TrueSkill library
+try:
+    import trueskill
+    TRUESKILL_AVAILABLE = True
+except ImportError:
+    TRUESKILL_AVAILABLE = False
+
+
+# ============================================================================
+# RATING DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Rating:
+    """Container for a rating with metadata"""
+    value: float
+    games_played: int = 0
+    wins: int = 0
+    losses: int = 0
+    ties: int = 0
+    last_updated: Optional[pd.Timestamp] = None
+    
+    @property
+    def win_rate(self) -> float:
+        if self.games_played == 0:
+            return 0.0
+        return self.wins / self.games_played
+    
+    def __repr__(self):
+        return f"Rating({self.value:.1f}, {self.games_played}g, {self.win_rate:.1%} wr)"
+
+
+# ============================================================================
+# BASE RANKING SYSTEM
+# ============================================================================
+
+class RankingSystem(ABC):
+    """Base class for all ranking systems"""
+    
+    def __init__(self):
+        self.rating_history: Dict[str, List[Tuple[pd.Timestamp, float]]] = defaultdict(list)
+    
+    @abstractmethod
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,  # 1.0 if A wins, 0.0 if B wins, 0.5 if tie
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update ratings based on match outcome"""
+        pass
+    
+    @abstractmethod
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get current rating for a strategy"""
+        pass
+    
+    @abstractmethod
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings as dictionary"""
+        pass
+    
+    def get_leaderboard(self, regime: Optional[str] = None, top_n: Optional[int] = None) -> pd.DataFrame:
+        """Get sorted leaderboard"""
+        ratings = self.get_all_ratings(regime)
+        
+        leaderboard = []
+        for name, rating in ratings.items():
+            leaderboard.append({
+                'strategy': name,
+                'rating': rating.value,
+                'games': rating.games_played,
+                'wins': rating.wins,
+                'losses': rating.losses,
+                'ties': rating.ties,
+                'win_rate': rating.win_rate
+            })
+        
+        df = pd.DataFrame(leaderboard)
+        if not df.empty:
+            df = df.sort_values('rating', ascending=False).reset_index(drop=True)
+            df.index = df.index + 1  # Start ranking at 1
+            if top_n:
+                df = df.head(top_n)
+        
+        return df
+    
+    def get_rating_history(self, strategy_name: str) -> pd.Series:
+        """Get historical ratings for a strategy"""
+        history = self.rating_history.get(strategy_name, [])
+        if not history:
+            return pd.Series(dtype=float)
+        
+        timestamps, ratings = zip(*history)
+        return pd.Series(ratings, index=timestamps)
+
+
+# ============================================================================
+# ELO RANKING SYSTEM
+# ============================================================================
+
+class ELORanking(RankingSystem):
+    """
+    Classic ELO rating system adapted for trading strategies.
+    Simple, interpretable, battle-tested.
+    """
+    
+    def __init__(self, k_factor: float = 32, initial_rating: float = 1500):
+        """
+        Args:
+            k_factor: Maximum rating change per game (32 is standard)
+            initial_rating: Starting rating for new strategies
+        """
+        super().__init__()
+        self.k_factor = k_factor
+        self.initial_rating = initial_rating
+        
+        # Global ratings
+        self.ratings: Dict[str, Rating] = defaultdict(
+            lambda: Rating(value=initial_rating)
+        )
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, Rating]] = defaultdict(
+            lambda: defaultdict(lambda: Rating(value=initial_rating))
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update ELO ratings based on match outcome"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._elo_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._elo_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                timestamp
+            )
+    
+    def _elo_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, Rating],
+        timestamp: pd.Timestamp
+    ):
+        """Core ELO update logic"""
+        # Get current ratings
+        rating_a = ratings_dict[name_a]
+        rating_b = ratings_dict[name_b]
+        
+        # Calculate expected scores
+        expected_a = self._expected_score(rating_a.value, rating_b.value)
+        expected_b = 1 - expected_a
+        
+        # Update ratings
+        rating_a.value += self.k_factor * (outcome - expected_a)
+        rating_b.value += self.k_factor * ((1 - outcome) - expected_b)
+        
+        # Update game counts
+        rating_a.games_played += 1
+        rating_b.games_played += 1
+        
+        if outcome == 1.0:
+            rating_a.wins += 1
+            rating_b.losses += 1
+        elif outcome == 0.0:
+            rating_a.losses += 1
+            rating_b.wins += 1
+        else:
+            rating_a.ties += 1
+            rating_b.ties += 1
+        
+        # Update timestamps
+        rating_a.last_updated = timestamp
+        rating_b.last_updated = timestamp
+        
+        # Store history
+        self.rating_history[name_a].append((timestamp, rating_a.value))
+        self.rating_history[name_b].append((timestamp, rating_b.value))
+    
+    def _expected_score(self, rating_a: float, rating_b: float) -> float:
+        """Calculate expected score for player A"""
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get current rating"""
+        if regime is None:
+            return self.ratings[strategy_name].value
+        else:
+            return self.regime_ratings[regime][strategy_name].value
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings"""
+        if regime is None:
+            return dict(self.ratings)
+        else:
+            return dict(self.regime_ratings[regime])
+
+
+# ============================================================================
+# TRUESKILL RANKING SYSTEM
+# ============================================================================
+
+class TrueSkillRanking(RankingSystem):
+    """
+    Microsoft's TrueSkill system - more sophisticated than ELO.
+    Tracks both skill (mu) and uncertainty (sigma).
+    Better for handling new strategies and variable skill.
+    """
+    
+    def __init__(
+        self,
+        mu: float = 25.0,
+        sigma: float = 25/3,
+        beta: float = 25/6,
+        tau: float = 25/300,
+        draw_probability: float = 0.1
+    ):
+        """
+        Args:
+            mu: Initial mean skill
+            sigma: Initial skill uncertainty
+            beta: Skill difference for 80% win probability
+            tau: Dynamics factor (skill drift over time)
+            draw_probability: Probability of draws
+        """
+        super().__init__()
+        
+        if not TRUESKILL_AVAILABLE:
+            raise ImportError("TrueSkill not installed. Install with: pip install trueskill")
+        
+        # Configure TrueSkill environment
+        self.env = trueskill.TrueSkill(
+            mu=mu,
+            sigma=sigma,
+            beta=beta,
+            tau=tau,
+            draw_probability=draw_probability
+        )
+        
+        # Global ratings
+        self.ratings: Dict[str, trueskill.Rating] = {}
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, trueskill.Rating]] = defaultdict(dict)
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update TrueSkill ratings"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._trueskill_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._trueskill_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                timestamp
+            )
+    
+    def _trueskill_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, trueskill.Rating],
+        timestamp: pd.Timestamp
+    ):
+        """Core TrueSkill update logic"""
+        # Initialize if needed
+        if name_a not in ratings_dict:
+            ratings_dict[name_a] = self.env.create_rating()
+        if name_b not in ratings_dict:
+            ratings_dict[name_b] = self.env.create_rating()
+        
+        # Determine ranks (lower is better)
+        if outcome == 1.0:  # A wins
+            ranks = [0, 1]
+        elif outcome == 0.0:  # B wins
+            ranks = [1, 0]
+        else:  # Tie
+            ranks = [0, 0]
+        
+        # Update ratings
+        (new_a,), (new_b,) = self.env.rate(
+            [(ratings_dict[name_a],), (ratings_dict[name_b],)],
+            ranks=ranks
+        )
+        
+        ratings_dict[name_a] = new_a
+        ratings_dict[name_b] = new_b
+        
+        # Store history (using conservative rating: mu - 3*sigma)
+        conservative_a = new_a.mu - 3 * new_a.sigma
+        conservative_b = new_b.mu - 3 * new_b.sigma
+        
+        self.rating_history[name_a].append((timestamp, conservative_a))
+        self.rating_history[name_b].append((timestamp, conservative_b))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get conservative rating (mu - 3*sigma)"""
+        if regime is None:
+            rating = self.ratings.get(strategy_name)
+        else:
+            rating = self.regime_ratings[regime].get(strategy_name)
+        
+        if rating is None:
+            return self.env.mu - 3 * self.env.sigma
+        
+        return rating.mu - 3 * rating.sigma
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings with uncertainty info"""
+        if regime is None:
+            ratings_dict = self.ratings
+        else:
+            ratings_dict = self.regime_ratings[regime]
+        
+        result = {}
+        for name, ts_rating in ratings_dict.items():
+            result[name] = Rating(
+                value=ts_rating.mu - 3 * ts_rating.sigma,
+                games_played=0  # TrueSkill doesn't track this directly
+            )
+        
+        return result
+
+
+# ============================================================================
+# BRADLEY-TERRY RANKING SYSTEM
+# ============================================================================
+
+class BradleyTerryRanking(RankingSystem):
+    """
+    Bradley-Terry model: probabilistic paired comparison model.
+    P(A beats B) = strength_A / (strength_A + strength_B)
+    Fitted using maximum likelihood estimation.
+    """
+    
+    def __init__(self, initial_strength: float = 1.0, learning_rate: float = 0.01):
+        """
+        Args:
+            initial_strength: Starting strength for new strategies
+            learning_rate: Step size for gradient updates
+        """
+        super().__init__()
+        self.initial_strength = initial_strength
+        self.learning_rate = learning_rate
+        
+        # Global strengths
+        self.strengths: Dict[str, float] = defaultdict(lambda: initial_strength)
+        self.game_counts: Dict[str, int] = defaultdict(int)
+        
+        # Regime-specific strengths
+        self.regime_strengths: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: defaultdict(lambda: initial_strength)
+        )
+        self.regime_game_counts: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update Bradley-Terry strengths via gradient descent"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global strengths
+        self._bt_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.strengths,
+            self.game_counts,
+            timestamp
+        )
+        
+        # Update regime-specific strengths
+        if regime is not None:
+            self._bt_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_strengths[regime],
+                self.regime_game_counts[regime],
+                timestamp
+            )
+    
+    def _bt_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        strengths_dict: Dict[str, float],
+        counts_dict: Dict[str, int],
+        timestamp: pd.Timestamp
+    ):
+        """Bradley-Terry gradient update"""
+        # Get current strengths
+        s_a = strengths_dict[name_a]
+        s_b = strengths_dict[name_b]
+        
+        # Predicted probability A wins
+        p_a_wins = s_a / (s_a + s_b)
+        
+        # Gradient update
+        error = outcome - p_a_wins
+        
+        strengths_dict[name_a] += self.learning_rate * error * s_b / (s_a + s_b)
+        strengths_dict[name_b] -= self.learning_rate * error * s_a / (s_a + s_b)
+        
+        # Ensure positive
+        strengths_dict[name_a] = max(0.01, strengths_dict[name_a])
+        strengths_dict[name_b] = max(0.01, strengths_dict[name_b])
+        
+        # Update counts
+        counts_dict[name_a] += 1
+        counts_dict[name_b] += 1
+        
+        # Store history (convert to rating-like scale)
+        rating_a = 1500 + 400 * np.log10(strengths_dict[name_a])
+        rating_b = 1500 + 400 * np.log10(strengths_dict[name_b])
+        
+        self.rating_history[name_a].append((timestamp, rating_a))
+        self.rating_history[name_b].append((timestamp, rating_b))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get rating (converted from strength)"""
+        if regime is None:
+            strength = self.strengths[strategy_name]
+        else:
+            strength = self.regime_strengths[regime][strategy_name]
+        
+        # Convert to ELO-like scale
+        return 1500 + 400 * np.log10(strength)
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings"""
+        if regime is None:
+            strengths_dict = self.strengths
+            counts_dict = self.game_counts
+        else:
+            strengths_dict = self.regime_strengths[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        result = {}
+        for name, strength in strengths_dict.items():
+            rating_value = 1500 + 400 * np.log10(strength)
+            result[name] = Rating(
+                value=rating_value,
+                games_played=counts_dict[name]
+            )
+        
+        return result
+
+# ============================================================================
+# BAYESIAN ELO RANKING SYSTEM (NEW)
+# ============================================================================
+
+class BayesianELORanking(RankingSystem):
+    """
+    ELO with Bayesian uncertainty tracking.
+    Each rating has (mu, sigma) where sigma represents confidence.
+    
+    Key differences from standard ELO:
+    - Tracks rating uncertainty (sigma)
+    - K-factor adapts based on uncertainty (higher sigma = faster learning)
+    - Can use conservative rating (mu - k*sigma) for risk-averse decisions
+    """
+    
+    def __init__(
+        self,
+        initial_mu: float = 1500,
+        initial_sigma: float = 350,
+        min_sigma: float = 50,
+        tau: float = 1.0,
+        base_k: float = 32
+    ):
+        """
+        Args:
+            initial_mu: Initial rating mean
+            initial_sigma: Initial rating uncertainty (high = very uncertain)
+            min_sigma: Minimum sigma (ratings never become 100% certain)
+            tau: Dynamics factor - how much sigma increases per game (model drift)
+            base_k: Base K-factor (will be scaled by uncertainty)
+        """
+        super().__init__()
+        self.initial_mu = initial_mu
+        self.initial_sigma = initial_sigma
+        self.min_sigma = min_sigma
+        self.tau = tau
+        self.base_k = base_k
+        
+        # Global ratings: {strategy_name: (mu, sigma)}
+        self.ratings: Dict[str, Tuple[float, float]] = defaultdict(
+            lambda: (initial_mu, initial_sigma)
+        )
+        self.game_counts: Dict[str, int] = defaultdict(int)
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, Tuple[float, float]]] = defaultdict(
+            lambda: defaultdict(lambda: (initial_mu, initial_sigma))
+        )
+        self.regime_game_counts: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update Bayesian ELO ratings"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._bayesian_elo_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            self.game_counts,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._bayesian_elo_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                self.regime_game_counts[regime],
+                timestamp
+            )
+    
+    def _bayesian_elo_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, Tuple[float, float]],
+        counts_dict: Dict[str, int],
+        timestamp: pd.Timestamp
+    ):
+        """Core Bayesian ELO update with uncertainty"""
+        # Get current ratings (mu, sigma)
+        mu_a, sigma_a = ratings_dict[name_a]
+        mu_b, sigma_b = ratings_dict[name_b]
+        
+        # Expected score (standard ELO formula using mu)
+        expected_a = 1 / (1 + 10 ** ((mu_b - mu_a) / 400))
+        
+        # Adaptive K-factor based on uncertainty
+        # Higher uncertainty = faster learning (higher K)
+        # This is the key Bayesian component
+        uncertainty_factor_a = sigma_a / self.initial_sigma
+        uncertainty_factor_b = sigma_b / self.initial_sigma
+        avg_uncertainty = (uncertainty_factor_a + uncertainty_factor_b) / 2
+        
+        # Scale K by uncertainty: very uncertain strategies learn faster
+        k_adapted = self.base_k * (0.5 + 1.5 * avg_uncertainty)
+        
+        # Update mu (same as standard ELO but with adaptive K)
+        error = outcome - expected_a
+        mu_a_new = mu_a + k_adapted * error
+        mu_b_new = mu_b - k_adapted * error
+        
+        # Update sigma (uncertainty decreases with more games)
+        # This is the Bayesian learning: we become more confident as we gather data
+        # But add tau to prevent overconfidence (model drift)
+        sigma_a_new = max(
+            self.min_sigma,
+            np.sqrt(sigma_a**2 / (1 + sigma_a**2 / self.initial_sigma**2)) + self.tau
+        )
+        sigma_b_new = max(
+            self.min_sigma,
+            np.sqrt(sigma_b**2 / (1 + sigma_b**2 / self.initial_sigma**2)) + self.tau
+        )
+        
+        # Store updated ratings
+        ratings_dict[name_a] = (mu_a_new, sigma_a_new)
+        ratings_dict[name_b] = (mu_b_new, sigma_b_new)
+        
+        # Update counts
+        counts_dict[name_a] = counts_dict.get(name_a, 0) + 1
+        counts_dict[name_b] = counts_dict.get(name_b, 0) + 1
+        
+        # Store history (using mu for plotting)
+        self.rating_history[name_a].append((timestamp, mu_a_new))
+        self.rating_history[name_b].append((timestamp, mu_b_new))
+    
+    def get_rating(
+        self,
+        strategy_name: str,
+        regime: Optional[str] = None,
+        conservative: bool = False,
+        conservative_factor: float = 2.0
+    ) -> float:
+        """
+        Get rating for a strategy.
+        
+        Args:
+            strategy_name: Name of strategy
+            regime: Regime (None = global)
+            conservative: If True, return mu - k*sigma (penalize uncertainty)
+            conservative_factor: How many standard deviations to subtract
+        """
+        if regime is None:
+            mu, sigma = self.ratings[strategy_name]
+        else:
+            mu, sigma = self.regime_ratings[regime][strategy_name]
+        
+        if conservative:
+            # Conservative rating: penalize uncertainty
+            # This is useful for risk-averse allocation decisions
+            return mu - conservative_factor * sigma
+        else:
+            return mu
+    
+    def get_uncertainty(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get rating uncertainty (sigma) for a strategy"""
+        if regime is None:
+            _, sigma = self.ratings[strategy_name]
+        else:
+            _, sigma = self.regime_ratings[regime][strategy_name]
+        return sigma
+    
+    def get_signal_to_noise(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get signal-to-noise ratio (mu/sigma) - higher is more reliable"""
+        if regime is None:
+            mu, sigma = self.ratings[strategy_name]
+        else:
+            mu, sigma = self.regime_ratings[regime][strategy_name]
+        
+        return mu / sigma if sigma > 0 else 0
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings as Rating objects"""
+        if regime is None:
+            ratings_dict = self.ratings
+            counts_dict = self.game_counts
+        else:
+            ratings_dict = self.regime_ratings[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        result = {}
+        for name, (mu, sigma) in ratings_dict.items():
+            result[name] = Rating(
+                value=mu,  # Use mu as the primary rating
+                games_played=counts_dict.get(name, 0)
+            )
+        
+        return result
+    
+    def get_leaderboard_with_uncertainty(
+        self,
+        regime: Optional[str] = None,
+        top_n: Optional[int] = None,
+        sort_by: str = 'mu'  # 'mu', 'conservative', or 'signal_to_noise'
+    ) -> pd.DataFrame:
+        """
+        Get leaderboard with uncertainty information.
+        
+        Args:
+            regime: Which regime
+            top_n: Limit to top N
+            sort_by: How to rank ('mu', 'conservative', 'signal_to_noise')
+        """
+        if regime is None:
+            ratings_dict = self.ratings
+            counts_dict = self.game_counts
+        else:
+            ratings_dict = self.regime_ratings[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        leaderboard = []
+        for name, (mu, sigma) in ratings_dict.items():
+            conservative = mu - 2.0 * sigma
+            snr = mu / sigma if sigma > 0 else 0
+            
+            leaderboard.append({
+                'strategy': name,
+                'mu': mu,
+                'sigma': sigma,
+                'conservative_rating': conservative,
+                'signal_to_noise': snr,
+                'games': counts_dict.get(name, 0)
+            })
+        
+        df = pd.DataFrame(leaderboard)
+        if not df.empty:
+            df = df.sort_values(sort_by, ascending=False).reset_index(drop=True)
+            df.index = df.index + 1
+            if top_n:
+                df = df.head(top_n)
+        
+        return df
+
+# ============================================================================
+# MULTI-METRIC RANKING MANAGER
+# ============================================================================
+
+class RankingManager:
+    """
+    Manages multiple ranking systems across metrics and regimes.
+    This is the main interface for the engine.
+    """
+    
+    def __init__(self, ranking_class=ELORanking, **ranking_kwargs):
+        """
+        Args:
+            ranking_class: Which ranking system to use (ELO, TrueSkill, etc.)
+            **ranking_kwargs: Arguments for the ranking system
+        """
+        self.ranking_class = ranking_class
+        self.ranking_kwargs = ranking_kwargs
+        
+        # Structure: rankings[metric][regime] = RankingSystem
+        self.rankings: Dict[str, Dict[Optional[str], RankingSystem]] = defaultdict(dict)
+        
+        # Track which metrics and regimes we've seen
+        self.metrics: set = set()
+        self.regimes: set = set()
+    
+    def update(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update rankings for a specific metric and regime"""
+        # Ensure ranking system exists
+        if regime not in self.rankings[metric]:
+            self.rankings[metric][regime] = self.ranking_class(**self.ranking_kwargs)
+        
+        # Track metrics and regimes
+        self.metrics.add(metric)
+        if regime is not None:
+            self.regimes.add(regime)
+        
+        # Update
+        self.rankings[metric][regime].update_ratings(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            regime,
+            timestamp
+        )
+    
+    def get_leaderboard(
+        self,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None,
+        top_n: Optional[int] = None
+    ) -> pd.DataFrame:
+        """Get leaderboard for specific metric and regime"""
+        if metric not in self.rankings or regime not in self.rankings[metric]:
+            return pd.DataFrame()
+        
+        return self.rankings[metric][regime].get_leaderboard(regime, top_n)
+    
+    def get_all_leaderboards(self) -> Dict[str, Dict[Optional[str], pd.DataFrame]]:
+        """Get all leaderboards across metrics and regimes"""
+        result = {}
+        for metric in self.metrics:
+            result[metric] = {}
+            for regime in [None] + list(self.regimes):
+                if regime in self.rankings[metric]:
+                    result[metric][regime] = self.get_leaderboard(metric, regime)
+        return result
+    
+    def get_rating_history(
+        self,
+        strategy_name: str,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None
+    ) -> pd.Series:
+        """Get rating history for a strategy"""
+        if metric in self.rankings and regime in self.rankings[metric]:
+            return self.rankings[metric][regime].get_rating_history(strategy_name)
+        return pd.Series(dtype=float)
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    print("="*60)
+    print("Ranking System v1 - Example Usage")
+    print("="*60)
+    
+    # Test ELO
+    print("\n" + "-"*60)
+    print("1. ELO Ranking System")
+    print("-"*60)
+    
+    elo = ELORanking(k_factor=32, initial_rating=1500)
+    
+    # Simulate some matches
+    matches = [
+        ("StrategyA", "StrategyB", 1.0, "high_vol"),
+        ("StrategyA", "StrategyC", 0.5, "high_vol"),
+        ("StrategyB", "StrategyC", 0.0, "high_vol"),
+        ("StrategyA", "StrategyB", 0.0, "low_vol"),
+        ("StrategyC", "StrategyB", 1.0, "low_vol"),
+    ]
+    
+    for strat_a, strat_b, outcome, regime in matches:
+        elo.update_ratings(strat_a, strat_b, outcome, regime)
+    
+    print("\nGlobal Leaderboard:")
+    print(elo.get_leaderboard())
+    
+    print("\nHigh Vol Regime Leaderboard:")
+    print(elo.get_leaderboard(regime="high_vol"))
+    
+    print("\nLow Vol Regime Leaderboard:")
+    print(elo.get_leaderboard(regime="low_vol"))
+    
+    # Test Ranking Manager
+    print("\n" + "-"*60)
+    print("2. Ranking Manager (Multi-Metric)")
+    print("-"*60)
+    
+    manager = RankingManager(ranking_class=ELORanking, k_factor=32)
+    
+    # Update different metrics
+    manager.update("StratA", "StratB", 1.0, metric='sharpe', regime='high_vol')
+    manager.update("StratA", "StratB", 0.0, metric='returns', regime='high_vol')
+    manager.update("StratA", "StratC", 1.0, metric='sharpe', regime='low_vol')
+    
+    print("\nSharpe Leaderboard (High Vol):")
+    print(manager.get_leaderboard('sharpe', 'high_vol'))
+    
+    print("\nReturns Leaderboard (High Vol):")
+    print(manager.get_leaderboard('returns', 'high_vol'))
+    
+    print("\n" + "="*60)
+    print("Ranking System Complete!")
+    print("="*60)
+
+"""
+Regime Detector v1: Market state and regime detection
+Initial implementations: Volatility, HMM, Change Point, Multifractal
+"""
+
+from abc import ABC, abstractmethod
+from typing import Optional, Dict, Any, List
+import pandas as pd
+import numpy as np
+from scipy import stats
+from sklearn.cluster import KMeans
+import warnings
+
+# Optional imports (install as needed)
+try:
+    from hmmlearn import hmm
+    HMM_AVAILABLE = True
+except ImportError:
+    HMM_AVAILABLE = False
+
+try:
+    import ruptures as rpt
+    RUPTURES_AVAILABLE = True
+except ImportError:
+    RUPTURES_AVAILABLE = False
+
+
+# ============================================================================
+# BASE REGIME DETECTOR
+# ============================================================================
+
+class RegimeDetector(ABC):
+    """
+    Base class for regime detection.
+    
+    A regime is a persistent market state (high vol, low vol, trending, etc.)
+    that affects strategy performance.
+    """
+    
+    def __init__(self, name: Optional[str] = None):
+        self.name = name or self.__class__.__name__
+        self.regime_labels: Optional[pd.Series] = None
+        self.regime_descriptions: Dict[int, str] = {}
+    
+    @abstractmethod
+    def detect_regimes(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Detect market regimes in the data.
+        
+        Args:
+            data: DataFrame with OHLCV data (datetime index)
+        
+        Returns:
+            pd.Series with datetime index and regime labels (0, 1, 2, ...)
+        """
+        pass
+    
+    def get_regime_stats(self, regimes: pd.Series) -> pd.DataFrame:
+        """Get summary statistics for each regime."""
+        unique_regimes = sorted(regimes.unique())
+        stats = []
+        
+        for regime in unique_regimes:
+            mask = regimes == regime
+            stats.append({
+                'regime': regime,
+                'count': mask.sum(),
+                'percentage': mask.sum() / len(regimes) * 100,
+                'description': self.regime_descriptions.get(regime, f"Regime {regime}")
+            })
+        
+        return pd.DataFrame(stats)
+    
+    def get_transitions(self, regimes: pd.Series) -> pd.DataFrame:
+        """Get regime transition matrix."""
+        unique_regimes = sorted(regimes.unique())
+        n = len(unique_regimes)
+        
+        # Build transition matrix
+        transitions = np.zeros((n, n))
+        for i in range(len(regimes) - 1):
+            from_regime = regimes.iloc[i]
+            to_regime = regimes.iloc[i + 1]
+            from_idx = unique_regimes.index(from_regime)
+            to_idx = unique_regimes.index(to_regime)
+            transitions[from_idx, to_idx] += 1
+        
+        # Normalize to probabilities
+        row_sums = transitions.sum(axis=1, keepdims=True)
+        row_sums[row_sums == 0] = 1  # Avoid division by zero
+        transition_probs = transitions / row_sums
+        
+        return pd.DataFrame(
+            transition_probs,
+            index=[f"From_{r}" for r in unique_regimes],
+            columns=[f"To_{r}" for r in unique_regimes]
+        )
+    
+    def __repr__(self):
+        return f"{self.name}()"
+
+
+# ============================================================================
+# VOLATILITY REGIME DETECTOR
+# ============================================================================
+
+class VolatilityRegimeDetector(RegimeDetector):
+    """
+    Simple regime detector based on rolling volatility.
+    Classifies periods as high/low volatility.
+    """
+    
+    def __init__(self, window: int = 20, num_regimes: int = 2, method: str = 'quantile'):
+        """
+        Args:
+            window: Rolling window for volatility calculation
+            num_regimes: Number of volatility regimes (2=high/low, 3=high/med/low)
+            method: 'quantile' or 'kmeans' for threshold determination
+        """
+        super().__init__()
+        self.window = window
+        self.num_regimes = num_regimes
+        self.method = method
+        self.name = f"VolRegime_{window}_{num_regimes}states"
+        
+        # Set regime descriptions
+        if num_regimes == 2:
+            self.regime_descriptions = {0: "Low Vol", 1: "High Vol"}
+        elif num_regimes == 3:
+            self.regime_descriptions = {0: "Low Vol", 1: "Medium Vol", 2: "High Vol"}
+        else:
+            self.regime_descriptions = {i: f"Vol Regime {i}" for i in range(num_regimes)}
+    
+    def detect_regimes(self, data: pd.DataFrame) -> pd.Series:
+        """Detect volatility regimes."""
+        # Calculate returns
+        returns = data['close'].pct_change()
+        
+        # Calculate rolling volatility (annualized)
+        vol = returns.rolling(window=self.window).std() * np.sqrt(252)
+        
+        # Remove NaN values
+        vol = vol.dropna()
+        
+        if len(vol) == 0:
+            raise ValueError("Not enough data to calculate volatility")
+        
+        # Determine regime thresholds
+        if self.method == 'quantile':
+            regimes = self._quantile_method(vol)
+        elif self.method == 'kmeans':
+            regimes = self._kmeans_method(vol)
+        else:
+            raise ValueError(f"Unknown method: {self.method}")
+        
+        self.regime_labels = regimes
+        return regimes
+    
+    def _quantile_method(self, vol: pd.Series) -> pd.Series:
+        """Assign regimes based on quantiles."""
+        regimes = pd.Series(0, index=vol.index, dtype=int)
+        
+        if self.num_regimes == 2:
+            # Split at median
+            threshold = vol.median()
+            regimes[vol >= threshold] = 1
+        else:
+            # Split into equal-sized buckets
+            quantiles = np.linspace(0, 1, self.num_regimes + 1)[1:-1]
+            thresholds = vol.quantile(quantiles)
+            
+            for i, threshold in enumerate(thresholds):
+                regimes[vol >= threshold] = i + 1
+        
+        return regimes
+    
+    def _kmeans_method(self, vol: pd.Series) -> pd.Series:
+        """Assign regimes using K-means clustering."""
+        # Reshape for sklearn
+        X = vol.values.reshape(-1, 1)
+        
+        # Fit K-means
+        kmeans = KMeans(n_clusters=self.num_regimes, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X)
+        
+        # Sort clusters by volatility level (0=low, 1=med, 2=high)
+        cluster_centers = kmeans.cluster_centers_.flatten()
+        sorted_clusters = np.argsort(cluster_centers)
+        label_map = {old: new for new, old in enumerate(sorted_clusters)}
+        labels = np.array([label_map[l] for l in labels])
+        
+        return pd.Series(labels, index=vol.index)
+
+
+# ============================================================================
+# HIDDEN MARKOV MODEL REGIME DETECTOR
+# ============================================================================
+
+class HMMRegimeDetector(RegimeDetector):
+    """
+    Hidden Markov Model for regime detection.
+    Discovers latent market states from observed returns.
+    """
+    
+    def __init__(self, num_regimes: int = 2, covariance_type: str = 'full', 
+                 n_iter: int = 100):
+        """
+        Args:
+            num_regimes: Number of hidden states
+            covariance_type: 'spherical', 'diag', 'full', 'tied'
+            n_iter: Maximum iterations for EM algorithm
+        """
+        super().__init__()
+        
+        if not HMM_AVAILABLE:
+            raise ImportError("hmmlearn not installed. Install with: pip install hmmlearn")
+        
+        self.num_regimes = num_regimes
+        self.covariance_type = covariance_type
+        self.n_iter = n_iter
+        self.name = f"HMM_{num_regimes}states"
+        
+        self.model = None
+        self.regime_descriptions = {i: f"HMM State {i}" for i in range(num_regimes)}
+    
+    def detect_regimes(self, data: pd.DataFrame) -> pd.Series:
+        """Detect regimes using HMM."""
+        # Calculate returns and volatility as features
+        returns = data['close'].pct_change().dropna()
+        
+        # Create feature matrix (returns and absolute returns)
+        features = pd.DataFrame({
+            'returns': returns,
+            'abs_returns': returns.abs(),
+        }).dropna()
+        
+        if len(features) < 10:
+            raise ValueError("Not enough data for HMM (need at least 10 samples)")
+        
+        X = features.values
+        
+        # Fit HMM
+        self.model = hmm.GaussianHMM(
+            n_components=self.num_regimes,
+            covariance_type=self.covariance_type,
+            n_iter=self.n_iter,
+            random_state=42
+        )
+        
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            self.model.fit(X)
+        
+        # Predict hidden states
+        hidden_states = self.model.predict(X)
+        
+        # Create regime series
+        regimes = pd.Series(hidden_states, index=features.index)
+        
+        # Characterize regimes based on mean returns and volatility
+        self._characterize_regimes(features, regimes)
+        
+        self.regime_labels = regimes
+        return regimes
+    
+    def _characterize_regimes(self, features: pd.DataFrame, regimes: pd.Series):
+        """Assign meaningful names to HMM states."""
+        regime_chars = []
+        
+        for regime in range(self.num_regimes):
+            mask = regimes == regime
+            mean_return = features.loc[mask, 'returns'].mean()
+            mean_vol = features.loc[mask, 'abs_returns'].mean()
+            
+            regime_chars.append({
+                'regime': regime,
+                'mean_return': mean_return,
+                'volatility': mean_vol
+            })
+        
+        # Sort by volatility and assign names
+        regime_chars.sort(key=lambda x: x['volatility'])
+        
+        if self.num_regimes == 2:
+            names = ["Low Vol", "High Vol"]
+        elif self.num_regimes == 3:
+            names = ["Low Vol", "Medium Vol", "High Vol"]
+        else:
+            names = [f"State {i}" for i in range(self.num_regimes)]
+        
+        for i, char in enumerate(regime_chars):
+            orig_regime = char['regime']
+            self.regime_descriptions[orig_regime] = names[i]
+
+
+# ============================================================================
+# CHANGE POINT REGIME DETECTOR
+# ============================================================================
+
+class ChangePointRegimeDetector(RegimeDetector):
+    """
+    Detects structural breaks in time series.
+    Each segment between breakpoints is a regime.
+    """
+    
+    def __init__(self, method: str = 'pelt', penalty: float = 10, min_size: int = 20):
+        """
+        Args:
+            method: 'pelt', 'binseg', or 'window' (ruptures library)
+            penalty: Penalty for adding breakpoints (higher = fewer breaks)
+            min_size: Minimum samples between breakpoints
+        """
+        super().__init__()
+        
+        if not RUPTURES_AVAILABLE:
+            raise ImportError("ruptures not installed. Install with: pip install ruptures")
+        
+        self.method = method
+        self.penalty = penalty
+        self.min_size = min_size
+        self.name = f"ChangePoint_{method}"
+        
+        self.breakpoints = None
+    
+    def detect_regimes(self, data: pd.DataFrame) -> pd.Series:
+        """Detect regimes via change point detection."""
+        # Use returns as the signal
+        returns = data['close'].pct_change().dropna()
+        signal = returns.values.reshape(-1, 1)
+        
+        if len(signal) < self.min_size * 2:
+            raise ValueError(f"Not enough data. Need at least {self.min_size * 2} samples.")
+        
+        # Choose algorithm
+        if self.method == 'pelt':
+            algo = rpt.Pelt(model='rbf', min_size=self.min_size)
+        elif self.method == 'binseg':
+            algo = rpt.Binseg(model='l2', min_size=self.min_size)
+        elif self.method == 'window':
+            algo = rpt.Window(width=self.min_size, model='l2')
+        else:
+            raise ValueError(f"Unknown method: {self.method}")
+        
+        # Fit and predict
+        algo.fit(signal)
+        self.breakpoints = algo.predict(pen=self.penalty)
+        
+        # Remove the last breakpoint (it's always the end of the series)
+        if self.breakpoints and self.breakpoints[-1] == len(signal):
+            self.breakpoints = self.breakpoints[:-1]
+        
+        # Create regime labels
+        regimes = np.zeros(len(returns), dtype=int)
+        for i, bp in enumerate(self.breakpoints):
+            regimes[bp:] = i + 1
+        
+        regimes_series = pd.Series(regimes, index=returns.index)
+        
+        # Describe regimes
+        for i in range(regimes_series.max() + 1):
+            self.regime_descriptions[i] = f"Regime {i}"
+        
+        self.regime_labels = regimes_series
+        return regimes_series
+    
+    def get_breakpoint_dates(self) -> List[pd.Timestamp]:
+        """Get the dates where regime changes occur."""
+        if self.regime_labels is None or self.breakpoints is None:
+            return []
+        
+        dates = []
+        for bp in self.breakpoints:
+            if bp < len(self.regime_labels):
+                dates.append(self.regime_labels.index[bp])
+        return dates
+
+
+# ============================================================================
+# MULTIFRACTAL REGIME DETECTOR
+# ============================================================================
+
+class MultifractalRegimeDetector(RegimeDetector):
+    """
+    Uses multifractal properties (Hurst exponent, tail index) to detect regimes.
+    Inspired by Mandelbrot's work on market fractality.
+    """
+    
+    def __init__(self, window: int = 60, num_regimes: int = 3):
+        """
+        Args:
+            window: Rolling window for fractal calculations
+            num_regimes: Number of regimes to detect
+        """
+        super().__init__()
+        self.window = window
+        self.num_regimes = num_regimes
+        self.name = f"Multifractal_{window}_{num_regimes}states"
+        
+        self.regime_descriptions = {i: f"Fractal Regime {i}" for i in range(num_regimes)}
+    
+    def detect_regimes(self, data: pd.DataFrame) -> pd.Series:
+        """Detect regimes using multifractal analysis."""
+        returns = data['close'].pct_change().dropna()
+        
+        # Calculate rolling Hurst exponent
+        hurst = self._rolling_hurst(returns, self.window)
+        
+        # Calculate rolling tail index (alpha in power law)
+        tail_index = self._rolling_tail_index(returns, self.window)
+        
+        # Combine features
+        features = pd.DataFrame({
+            'hurst': hurst,
+            'tail_index': tail_index
+        }).dropna()
+        
+        if len(features) < 10:
+            raise ValueError("Not enough data for multifractal analysis")
+        
+        # Cluster based on fractal properties
+        X = features.values
+        kmeans = KMeans(n_clusters=self.num_regimes, random_state=42, n_init=10)
+        labels = kmeans.fit_predict(X)
+        
+        regimes = pd.Series(labels, index=features.index)
+        
+        # Characterize regimes
+        self._characterize_fractal_regimes(features, regimes)
+        
+        self.regime_labels = regimes
+        return regimes
+    
+    def _rolling_hurst(self, returns: pd.Series, window: int) -> pd.Series:
+        """
+        Calculate rolling Hurst exponent using R/S analysis.
+        H < 0.5: mean-reverting
+        H = 0.5: random walk
+        H > 0.5: trending/persistent
+        """
+        def hurst_exponent(ts):
+            """Simplified Hurst calculation."""
+            if len(ts) < 20:
+                return np.nan
+            
+            lags = range(2, min(20, len(ts) // 2))
+            tau = []
+            
+            for lag in lags:
+                # Calculate standard deviation of differences at this lag
+                std_diff = np.std(np.diff(ts, n=lag))
+                tau.append(std_diff)
+            
+            if len(tau) < 2:
+                return np.nan
+            
+            # Fit log(tau) vs log(lag)
+            poly = np.polyfit(np.log(lags), np.log(tau), 1)
+            return poly[0]  # Slope is Hurst exponent
+        
+        hurst = returns.rolling(window=window).apply(hurst_exponent, raw=False)
+        return hurst
+    
+    def _rolling_tail_index(self, returns: pd.Series, window: int) -> pd.Series:
+        """
+        Estimate tail index (alpha) using Hill estimator.
+        Lower alpha = fatter tails (more extreme events)
+        """
+        def hill_estimator(ts, k=None):
+            """Hill estimator for tail index."""
+            if len(ts) < 10:
+                return np.nan
+            
+            abs_ts = np.abs(ts)
+            k = k or max(5, len(ts) // 4)  # Use top 25% for tail
+            
+            sorted_ts = np.sort(abs_ts)[::-1]  # Descending
+            
+            if sorted_ts[k-1] <= 0:
+                return np.nan
+            
+            # Hill estimator
+            alpha = k / np.sum(np.log(sorted_ts[:k] / sorted_ts[k-1]))
+            return alpha
+        
+        tail = returns.rolling(window=window).apply(hill_estimator, raw=False)
+        return tail
+    
+    def _characterize_fractal_regimes(self, features: pd.DataFrame, regimes: pd.Series):
+        """Assign meaningful names based on fractal properties."""
+        for regime in range(self.num_regimes):
+            mask = regimes == regime
+            mean_hurst = features.loc[mask, 'hurst'].mean()
+            mean_tail = features.loc[mask, 'tail_index'].mean()
+            
+            # Characterize
+            if mean_hurst < 0.45:
+                trend = "Mean-Reverting"
+            elif mean_hurst > 0.55:
+                trend = "Trending"
+            else:
+                trend = "Random"
+            
+            if mean_tail < 3:
+                tail = "Fat-Tailed"
+            elif mean_tail > 4:
+                tail = "Thin-Tailed"
+            else:
+                tail = "Normal-Tailed"
+            
+            self.regime_descriptions[regime] = f"{trend} + {tail}"
+
+
+# ============================================================================
+# REGIME DETECTOR REGISTRY
+# ============================================================================
+
+class RegimeDetectorRegistry:
+    """Registry for managing multiple regime detectors."""
+    
+    def __init__(self):
+        self.detectors: Dict[str, RegimeDetector] = {}
+    
+    def register(self, detector: RegimeDetector):
+        """Add a detector to the registry."""
+        self.detectors[detector.name] = detector
+    
+    def get(self, name: str) -> Optional[RegimeDetector]:
+        """Get detector by name."""
+        return self.detectors.get(name)
+    
+    def list_all(self) -> List[str]:
+        """List all detector names."""
+        return list(self.detectors.keys())
+    
+    def __repr__(self):
+        return f"RegimeDetectorRegistry({len(self.detectors)} detectors)"
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    print("="*60)
+    print("Regime Detector v1 - Example Usage")
+    print("="*60)
+    
+    # Generate synthetic data
+    np.random.seed(42)
+    dates = pd.date_range('2020-01-01', periods=500, freq='D')
+    
+    # Simulate regime changes: low vol -> high vol -> low vol
+    regime_1 = np.random.randn(200) * 0.01  # Low vol
+    regime_2 = np.random.randn(150) * 0.03  # High vol
+    regime_3 = np.random.randn(150) * 0.01  # Low vol again
+    
+    returns = np.concatenate([regime_1, regime_2, regime_3])
+    price = 100 * np.exp(np.cumsum(returns))
+    
+    data = pd.DataFrame({
+        'close': price,
+        'volume': np.random.randint(1000, 10000, len(dates))
+    }, index=dates)
+    
+    print(f"\nGenerated {len(data)} days of synthetic data with regime changes")
+    
+    # Test Volatility Regime Detector
+    print("\n" + "-"*60)
+    print("1. Volatility Regime Detector")
+    print("-"*60)
+    vol_detector = VolatilityRegimeDetector(window=20, num_regimes=2)
+    vol_regimes = vol_detector.detect_regimes(data)
+    print(f"Detected regimes: {vol_regimes.unique()}")
+    print("\nRegime Statistics:")
+    print(vol_detector.get_regime_stats(vol_regimes))
+    
+    # Test HMM Regime Detector (if available)
+    if HMM_AVAILABLE:
+        print("\n" + "-"*60)
+        print("2. HMM Regime Detector")
+        print("-"*60)
+        hmm_detector = HMMRegimeDetector(num_regimes=2)
+        hmm_regimes = hmm_detector.detect_regimes(data)
+        print(f"Detected regimes: {hmm_regimes.unique()}")
+        print("\nRegime Statistics:")
+        print(hmm_detector.get_regime_stats(hmm_regimes))
+    
+    # Test Change Point Detector (if available)
+    if RUPTURES_AVAILABLE:
+        print("\n" + "-"*60)
+        print("3. Change Point Detector")
+        print("-"*60)
+        cp_detector = ChangePointRegimeDetector(penalty=5)
+        cp_regimes = cp_detector.detect_regimes(data)
+        print(f"Detected regimes: {cp_regimes.unique()}")
+        print(f"Breakpoint dates: {cp_detector.get_breakpoint_dates()}")
+        print("\nRegime Statistics:")
+        print(cp_detector.get_regime_stats(cp_regimes))
+    
+    # Test Multifractal Detector
+    print("\n" + "-"*60)
+    print("4. Multifractal Detector")
+    print("-"*60)
+    mf_detector = MultifractalRegimeDetector(window=60, num_regimes=3)
+    mf_regimes = mf_detector.detect_regimes(data)
+    print(f"Detected regimes: {mf_regimes.unique()}")
+    print("\nRegime Statistics:")
+    print(mf_detector.get_regime_stats(mf_regimes))
+    
+    print("\n" + "="*60)
+    print("Regime Detection Complete!")
+    print("="*60)
+
+"""
+Strategy Zoo: Initial Implementation with 5 Baseline Strategies
+"""
+
+from abc import ABC, abstractmethod
+from typing import List, Dict, Any, Optional
+import pandas as pd
+import numpy as np
+
+
+# ============================================================================
+# BASE STRATEGY CLASS
+# ============================================================================
+
+class Strategy(ABC):
+    """Base class for all trading strategies"""
+    
+    def __init__(self):
+        self.name: str = self.__class__.__name__
+        self.strategy_type: str = "unknown"
+        self.required_features: List[str] = ['close']
+        self.forecast_horizon: int = 1  # periods ahead
+        
+    @abstractmethod
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        """
+        Generate trading signals from data.
+        
+        Args:
+            data: DataFrame with OHLCV data (datetime index)
+        
+        Returns:
+            pd.Series with datetime index and signal values in [-1, 1]
+            -1 = max short, 0 = neutral, +1 = max long
+        """
+        pass
+    
+    def warmup_period(self) -> int:
+        """Number of bars needed before strategy can generate valid signals"""
+        return 0
+    
+    def get_tags(self) -> Dict[str, Any]:
+        """Metadata tags for filtering/grouping strategies"""
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': None,
+            'trend_regime': None,
+            'complexity': 'simple',
+        }
+    
+    def validate_data(self, data: pd.DataFrame) -> bool:
+        """Check if data has required features"""
+        missing = set(self.required_features) - set(data.columns)
+        if missing:
+            raise ValueError(f"Missing required features: {missing}")
+        return True
+    
+    def __repr__(self):
+        return f"{self.name}(type={self.strategy_type}, horizon={self.forecast_horizon})"
+
+
+# ============================================================================
+# STRATEGY 1: BUY AND HOLD
+# ============================================================================
+
+class BuyAndHold(Strategy):
+    """
+    Baseline: Always long, never adjusts position.
+    This is the benchmark everyone should beat.
+    """
+    
+    def __init__(self):
+        super().__init__()
+        self.strategy_type = "passive"
+        self.required_features = ['close']
+        self.forecast_horizon = 1
+        
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        self.validate_data(data)
+        # Always return +1 (max long)
+        return pd.Series(1.0, index=data.index)
+    
+    def warmup_period(self) -> int:
+        return 0
+    
+    def get_tags(self) -> Dict[str, Any]:
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': 'any',
+            'trend_regime': 'trending',
+            'complexity': 'trivial',
+        }
+
+
+# ============================================================================
+# STRATEGY 2: SIMPLE MOVING AVERAGE CROSSOVER
+# ============================================================================
+
+class SMACrossover(Strategy):
+    """
+    Classic trend-following: long when fast MA > slow MA, short otherwise.
+    """
+    
+    def __init__(self, fast_period: int = 20, slow_period: int = 50):
+        super().__init__()
+        self.strategy_type = "momentum"
+        self.required_features = ['close']
+        self.forecast_horizon = 1
+        self.fast_period = fast_period
+        self.slow_period = slow_period
+        self.name = f"SMAXover_{fast_period}_{slow_period}"
+        
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        self.validate_data(data)
+        
+        # Calculate moving averages
+        fast_ma = data['close'].rolling(window=self.fast_period).mean()
+        slow_ma = data['close'].rolling(window=self.slow_period).mean()
+        
+        # Generate signal: +1 when fast > slow, -1 when fast < slow
+        signal = pd.Series(0.0, index=data.index)
+        signal[fast_ma > slow_ma] = 1.0
+        signal[fast_ma < slow_ma] = -1.0
+        
+        return signal
+    
+    def warmup_period(self) -> int:
+        return self.slow_period
+    
+    def get_tags(self) -> Dict[str, Any]:
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': 'any',
+            'trend_regime': 'trending',
+            'complexity': 'simple',
+        }
+
+
+# ============================================================================
+# STRATEGY 3: MEAN REVERSION (BOLLINGER BANDS)
+# ============================================================================
+
+class BollingerMeanReversion(Strategy):
+    """
+    Mean reversion: buy when price touches lower band, sell at upper band.
+    """
+    
+    def __init__(self, period: int = 20, num_std: float = 2.0):
+        super().__init__()
+        self.strategy_type = "mean_reversion"
+        self.required_features = ['close']
+        self.forecast_horizon = 1
+        self.period = period
+        self.num_std = num_std
+        self.name = f"BollingerMR_{period}_{num_std}"
+        
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        self.validate_data(data)
+        
+        # Calculate Bollinger Bands
+        sma = data['close'].rolling(window=self.period).mean()
+        std = data['close'].rolling(window=self.period).std()
+        
+        upper_band = sma + (self.num_std * std)
+        lower_band = sma - (self.num_std * std)
+        
+        # Generate signal
+        # Long when price is below lower band (oversold)
+        # Short when price is above upper band (overbought)
+        signal = pd.Series(0.0, index=data.index)
+        
+        # Normalize distance to bands to get continuous signal
+        distance_to_middle = (data['close'] - sma) / (self.num_std * std)
+        signal = -distance_to_middle.clip(-1, 1)  # Invert: buy low, sell high
+        
+        return signal
+    
+    def warmup_period(self) -> int:
+        return self.period
+    
+    def get_tags(self) -> Dict[str, Any]:
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': 'low_vol',
+            'trend_regime': 'mean_reverting',
+            'complexity': 'simple',
+        }
+
+
+# ============================================================================
+# STRATEGY 4: MOMENTUM (RSI-BASED)
+# ============================================================================
+
+class RSIMomentum(Strategy):
+    """
+    Momentum based on Relative Strength Index.
+    """
+    
+    def __init__(self, period: int = 14, overbought: float = 70, oversold: float = 30):
+        super().__init__()
+        self.strategy_type = "momentum"
+        self.required_features = ['close']
+        self.forecast_horizon = 1
+        self.period = period
+        self.overbought = overbought
+        self.oversold = oversold
+        self.name = f"RSI_{period}"
+        
+    def calculate_rsi(self, prices: pd.Series) -> pd.Series:
+        """Calculate RSI"""
+        delta = prices.diff()
+        
+        gain = (delta.where(delta > 0, 0)).rolling(window=self.period).mean()
+        loss = (-delta.where(delta < 0, 0)).rolling(window=self.period).mean()
+        
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        
+        return rsi
+    
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        self.validate_data(data)
+        
+        rsi = self.calculate_rsi(data['close'])
+        
+        # Generate signal based on RSI
+        # RSI < 30: oversold (buy signal) -> +1
+        # RSI > 70: overbought (sell signal) -> -1
+        # Scale linearly between these zones
+        signal = pd.Series(0.0, index=data.index)
+        
+        # Map RSI [0, 100] to signal [-1, 1]
+        # RSI 50 (neutral) -> 0
+        # RSI 0 (extremely oversold) -> +1
+        # RSI 100 (extremely overbought) -> -1
+        signal = (50 - rsi) / 50
+        signal = signal.clip(-1, 1)
+        
+        return signal
+    
+    def warmup_period(self) -> int:
+        return self.period + 1
+    
+    def get_tags(self) -> Dict[str, Any]:
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': 'any',
+            'trend_regime': 'any',
+            'complexity': 'simple',
+        }
+
+
+# ============================================================================
+# STRATEGY 5: VOLATILITY TARGETING
+# ============================================================================
+
+class VolatilityTargeting(Strategy):
+    """
+    Adjusts position size based on recent volatility.
+    Long when vol is low (expect mean reversion), reduce when vol spikes.
+    """
+    
+    def __init__(self, lookback: int = 20, target_vol: float = 0.15):
+        super().__init__()
+        self.strategy_type = "volatility"
+        self.required_features = ['close']
+        self.forecast_horizon = 1
+        self.lookback = lookback
+        self.target_vol = target_vol
+        self.name = f"VolTarget_{lookback}"
+        
+    def generate_signal(self, data: pd.DataFrame) -> pd.Series:
+        self.validate_data(data)
+        
+        # Calculate returns and realized volatility
+        returns = data['close'].pct_change()
+        realized_vol = returns.rolling(window=self.lookback).std() * np.sqrt(252)  # Annualized
+        
+        # Signal is inverse of volatility (scaled)
+        # Lower vol -> higher position size
+        # Higher vol -> lower position size
+        # Always maintains long bias
+        vol_ratio = self.target_vol / realized_vol.replace(0, np.nan)
+        signal = vol_ratio.clip(0, 2) - 1  # Map to [-1, 1] range
+        signal = signal.fillna(0)
+        
+        return signal
+    
+    def warmup_period(self) -> int:
+        return self.lookback + 1
+    
+    def get_tags(self) -> Dict[str, Any]:
+        return {
+            'asset_class_specialization': None,
+            'volatility_regime': 'any',
+            'trend_regime': 'any',
+            'complexity': 'simple',
+        }
+
+
+# ============================================================================
+# STRATEGY REGISTRY
+# ============================================================================
+
+class StrategyRegistry:
+    """
+    Centralized registry for all strategies.
+    Makes it easy to instantiate and manage the strategy universe.
+    """
+    
+    def __init__(self):
+        self.strategies: Dict[str, Strategy] = {}
+        
+    def register(self, strategy: Strategy) -> None:
+        """Add a strategy to the registry"""
+        self.strategies[strategy.name] = strategy
+        
+    def get(self, name: str) -> Optional[Strategy]:
+        """Retrieve a strategy by name"""
+        return self.strategies.get(name)
+    
+    def list_all(self) -> List[str]:
+        """List all registered strategy names"""
+        return list(self.strategies.keys())
+    
+    def filter_by_type(self, strategy_type: str) -> List[Strategy]:
+        """Get all strategies of a given type"""
+        return [s for s in self.strategies.values() if s.strategy_type == strategy_type]
+    
+    def filter_by_tag(self, tag_key: str, tag_value: Any) -> List[Strategy]:
+        """Filter strategies by tag"""
+        return [
+            s for s in self.strategies.values() 
+            if s.get_tags().get(tag_key) == tag_value
+        ]
+    
+    def get_summary(self) -> pd.DataFrame:
+        """Get summary table of all strategies"""
+        summary = []
+        for strat in self.strategies.values():
+            tags = strat.get_tags()
+            summary.append({
+                'name': strat.name,
+                'type': strat.strategy_type,
+                'horizon': strat.forecast_horizon,
+                'warmup': strat.warmup_period(),
+                'complexity': tags.get('complexity'),
+                'regime': tags.get('trend_regime'),
+            })
+        return pd.DataFrame(summary)
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    # Create registry
+    registry = StrategyRegistry()
+    
+    # Register our 5 baseline strategies
+    registry.register(BuyAndHold())
+    registry.register(SMACrossover(fast_period=20, slow_period=50))
+    registry.register(BollingerMeanReversion(period=20, num_std=2.0))
+    registry.register(RSIMomentum(period=14))
+    registry.register(VolatilityTargeting(lookback=20))
+    
+    # Show summary
+    print("Strategy Zoo - Initial Universe:")
+    print(registry.get_summary())
+    print(f"\nTotal strategies: {len(registry.list_all())}")
+    
+    # Example: Test a strategy with dummy data
+    dates = pd.date_range('2020-01-01', periods=100, freq='D')
+    dummy_data = pd.DataFrame({
+        'close': 100 + np.cumsum(np.random.randn(100) * 2),
+        'volume': np.random.randint(1000, 10000, 100)
+    }, index=dates)
+    
+    print("\n" + "="*60)
+    print("Testing SMA Crossover strategy on dummy data:")
+    sma_strat = registry.get('SMAXover_20_50')
+    signals = sma_strat.generate_signal(dummy_data)
+    print(f"Generated {len(signals)} signals")
+    print(f"Long signals: {(signals > 0).sum()}")
+    print(f"Short signals: {(signals < 0).sum()}")
+    print(f"Neutral signals: {(signals == 0).sum()}")
+
+"""
+Main Engine v1.2 - Bayesian ELO as the primary ranking system
+
+This is the updated top-level engine that uses the BayesianELORanking
+implementation (with uncertainty tracking) as the ranking system for
+alpha and tail-survival tournaments.
+
+Drop this file next to your existing modules (data_manager, regime_detector,
+strategy_zoo, backtest_engine, matchmaker, ranking, analyzer) and run.
+"""
+
+from data_manager import DataManager
+from regime_detector import HMMRegimeDetector
+from strategy_zoo import StrategyRegistry, BuyAndHold, SMACrossover, BollingerMeanReversion, RSIMomentum
+from backtest_engine import BacktestEngine, BacktestResult
+from matchmaker import RoundRobinMatcher
+from ranking import RankingManager, BayesianELORanking  # <- use Bayesian ranking
+from analyzer import MetaELOAnalyzer
+
+import pandas as pd
+import numpy as np
+from typing import Dict, Optional
+
+# ---------------------------
+# Helper: comparison function
+# ---------------------------
+def _compare_strategies_alpha(
+    result_a: BacktestResult,
+    result_b: BacktestResult,
+    metric: str = 'alpha'
+) -> float:
+    """
+    Compare strategies on ALPHA (market-neutral returns), not raw returns.
+    Returns:
+        1.0 if A > B, 0.0 if B > A, 0.5 if tie.
+    """
+    if metric == 'alpha':
+        # Compare on alpha returns if available
+        if getattr(result_a, 'alpha_returns', None) is not None and getattr(result_b, 'alpha_returns', None) is not None:
+            alpha_a = float(np.nanmean(result_a.alpha_returns))
+            alpha_b = float(np.nanmean(result_b.alpha_returns))
+        else:
+            # Fallback to raw returns (not ideal but safe)
+            alpha_a = float(np.nanmean(result_a.returns))
+            alpha_b = float(np.nanmean(result_b.returns))
+
+    elif metric == 'tail_survival':
+        tail_a = getattr(result_a, 'tail_metrics', {}) or {}
+        tail_b = getattr(result_b, 'tail_metrics', {}) or {}
+
+        # We define "survival score" as stress_mean (higher is better) - choose robust fallback
+        alpha_a = float(tail_a.get('stress_mean', -np.inf))
+        alpha_b = float(tail_b.get('stress_mean', -np.inf))
+
+    else:
+        # Generic metric access (from result.metrics)
+        alpha_a = float(result_a.metrics.get(metric, -np.inf))
+        alpha_b = float(result_b.metrics.get(metric, -np.inf))
+
+    # Comparison with tolerance
+    if np.isnan(alpha_a) and np.isnan(alpha_b):
+        return 0.5
+    if np.isnan(alpha_a):
+        return 0.0
+    if np.isnan(alpha_b):
+        return 1.0
+
+    if alpha_a > alpha_b:
+        return 1.0
+    elif alpha_b > alpha_a:
+        return 0.0
+    else:
+        return 0.5
+
+# ---------------------------
+# Main run loop
+# ---------------------------
+def run():
+    print("="*100)
+    print("Trading Strategy ELO Engine v1.2 - Bayesian ELO (with Uncertainty) + Tail Risk")
+    print("="*100)
+
+    # Initialize components
+    print("\n[Step 1] Initializing components...")
+    data_manager = DataManager(cache_dir='./data_cache')
+    regime_detector = HMMRegimeDetector(num_regimes=3)
+    strategy_registry = StrategyRegistry()
+
+    # Backtest engine (expects to support benchmark_data and to populate alpha/beta on results)
+    backtest_engine = BacktestEngine(benchmark_symbol='SPY')
+
+    # Matchmaker: round-robin across strategies and regimes
+    matchmaker = RoundRobinMatcher(include_global=True)
+
+    # Use the BayesianELORanking as the ranking backend for the RankingManager.
+    ranking_manager = RankingManager(
+        ranking_class=BayesianELORanking,
+        initial_mu=1500,
+        initial_sigma=350,
+        min_sigma=50,
+        tau=1.0,
+        base_k=32
+    )
+
+    # Register strategies (simple set for demo)
+    print("\n[Step 2] Registering strategies...")
+    strategy_registry.register(BuyAndHold())
+    strategy_registry.register(SMACrossover(fast_period=20, slow_period=50))
+    strategy_registry.register(SMACrossover(fast_period=50, slow_period=200))
+    strategy_registry.register(BollingerMeanReversion(period=20, num_std=2.0))
+    strategy_registry.register(RSIMomentum(period=14))
+
+    # Experiment parameters
+    target_symbol = 'SPY'
+    benchmark_symbol = 'SPY'
+    start_date = '2020-01-01'
+    end_date = '2024-01-01'
+    initial_capital = 100_000
+
+    try:
+        # Fetch market and benchmark data
+        print(f"\n[Step 3] Fetching market data for {target_symbol}...")
+        market_data = data_manager.fetch_data(symbol=target_symbol, start_date=start_date, end_date=end_date)
+
+        # For now benchmark = target; production could fetch separately
+        benchmark_data = market_data.copy()
+
+        # Detect regimes
+        print("\n[Step 4] Detecting regimes...")
+        regimes = regime_detector.detect_regimes(market_data)
+        # regimes should be a pd.Series indexed the same as market_data
+
+        # Run backtests with benchmark data - populate dictionary of results
+        print("\n[Step 5] Running backtests (alpha/beta separation enabled in engine)...")
+        all_results: Dict[str, BacktestResult] = {}
+        strategies_list = [s for s in strategy_registry.strategies.values()]
+
+        for strategy in strategies_list:
+            print(f"   Backtesting {strategy.name} ...", end='', flush=True)
+            result: BacktestResult = backtest_engine.run_backtest(
+                strategy,
+                market_data,
+                initial_capital=initial_capital,
+                benchmark_data=benchmark_data  # engine should compute alpha/beta if implemented
+            )
+            all_results[strategy.name] = result
+            print(" done.")
+
+            # Print quick diagnostics when available
+            beta_str = f"{result.beta:6.3f}" if getattr(result, 'beta', None) is not None else "  n/a "
+            tail_metrics = getattr(result, 'tail_metrics', {}) or {}
+            stress_mean = tail_metrics.get('stress_mean', np.nan)
+            stress_days = tail_metrics.get('stress_positive_days', None)
+            stress_days_str = f"{int(stress_days):2d}" if stress_days is not None else " n/a"
+            print(f"      Beta: {beta_str} | StressMean: {stress_mean:7.4f} | StressDays: {stress_days_str}")
+
+        # Generate matchups
+        print("\n[Step 6] Generating round-robin matchups (per regime + global)...")
+        matchups = matchmaker.generate_matchups(strategies_list, market_data, regimes, asset=target_symbol)
+
+        # Run tournament on ALPHA and TAIL_SURVIVAL - updating Bayesian ELO via RankingManager
+        print("\n[Step 7] Running Bayesian ELO tournament (alpha + tail_survival)...")
+        for matchup in matchups:
+            strat_a = matchup.strategy_a
+            strat_b = matchup.strategy_b
+            regime_label = getattr(matchup, 'regime', None)
+
+            result_a = all_results[strat_a.name]
+            result_b = all_results[strat_b.name]
+
+            # Primary metric: market-neutral alpha
+            outcome_alpha = _compare_strategies_alpha(result_a, result_b, metric='alpha')
+
+            # Tail survival metric (higher stress_mean means better)
+            outcome_tail = _compare_strategies_alpha(result_a, result_b, metric='tail_survival')
+
+            # Update rankings for alpha
+            ranking_manager.update(
+                strategy_a_name=strat_a.name,
+                strategy_b_name=strat_b.name,
+                outcome=outcome_alpha,
+                metric='alpha',
+                regime=regime_label,
+                timestamp=None
+            )
+
+            # Update rankings for tail survival
+            ranking_manager.update(
+                strategy_a_name=strat_a.name,
+                strategy_b_name=strat_b.name,
+                outcome=outcome_tail,
+                metric='tail_survival',
+                regime=regime_label,
+                timestamp=None
+            )
+
+        # Final leaderboards: use BayesianELORanking's uncertainty-aware leaderboard where available
+        print("\n" + "="*100)
+        print("FINAL BAYESIAN ELO LEADERBOARDS (Alpha & Tail Survival)")
+        print("="*100)
+
+        # Alpha (global)
+        print("\n--- BAYESIAN ALPHA LEADERBOARD (global) ---")
+        # RankingManager stores ranking objects in rankings[metric][regime]
+        alpha_global_ranking_system = ranking_manager.rankings.get('alpha', {}).get(None)
+        if alpha_global_ranking_system is not None and hasattr(alpha_global_ranking_system, 'get_leaderboard_with_uncertainty'):
+            print(alpha_global_ranking_system.get_leaderboard_with_uncertainty(sort_by='conservative_rating', top_n=None).to_string(index=True))
+        else:
+            print(ranking_manager.get_leaderboard(metric='alpha', regime=None).to_string())
+
+        # Tail survival (global)
+        print("\n--- BAYESIAN TAIL SURVIVAL LEADERBOARD (global) ---")
+        tail_global_ranking_system = ranking_manager.rankings.get('tail_survival', {}).get(None)
+        if tail_global_ranking_system is not None and hasattr(tail_global_ranking_system, 'get_leaderboard_with_uncertainty'):
+            print(tail_global_ranking_system.get_leaderboard_with_uncertainty(sort_by='conservative_rating', top_n=None).to_string(index=True))
+        else:
+            print(ranking_manager.get_leaderboard(metric='tail_survival', regime=None).to_string())
+
+        # Per-regime leaderboards (alpha)
+        regimes_seen = sorted(list(regimes.unique())) if hasattr(regimes, 'unique') else []
+        for regime_label in regimes_seen:
+            print(f"\n--- BAYESIAN ALPHA LEADERBOARD (Regime {regime_label}) ---")
+            ranking_sys = ranking_manager.rankings.get('alpha', {}).get(regime_label)
+            if ranking_sys is not None and hasattr(ranking_sys, 'get_leaderboard_with_uncertainty'):
+                print(ranking_sys.get_leaderboard_with_uncertainty(sort_by='conservative_rating').to_string(index=True))
+            else:
+                df = ranking_manager.get_leaderboard(metric='alpha', regime=regime_label)
+                if not df.empty:
+                    print(df.to_string())
+                else:
+                    print(" (no data) ")
+
+        # Meta-analysis using MetaELOAnalyzer (works over RankingManager)
+        print("\n" + "="*100)
+        print("META ANALYSIS (Bayesian ELO)")
+        print("="*100)
+
+        meta_analyzer = MetaELOAnalyzer(ranking_manager)
+
+        print("\n--- ELO VELOCITY (Alpha metric, global) ---")
+        velocity = meta_analyzer.get_velocity_ranking(metric='alpha', regime=None)
+        if isinstance(velocity, pd.DataFrame) and not velocity.empty:
+            print(velocity.to_string())
+        else:
+            print("(no velocity data)")
+
+        print("\n--- STRATEGY LIFECYCLE (Alpha metric, global) ---")
+        lifecycle = meta_analyzer.get_lifecycle_report(metric='alpha', regime=None)
+        if isinstance(lifecycle, pd.DataFrame) and not lifecycle.empty:
+            print(lifecycle.to_string())
+        else:
+            print("(no lifecycle data)")
+
+    except Exception as e:
+        print(f"\n[ERROR] {e}")
+        import traceback
+        traceback.print_exc()
+
+
+if __name__ == "__main__":
+    run()
+
+"""
+Ranking System v1: ELO, TrueSkill, and Bradley-Terry rankings for strategies
+"""
+
+from abc import ABC, abstractmethod
+from typing import Dict, Optional, List, Tuple
+from collections import defaultdict
+from dataclasses import dataclass
+import pandas as pd
+import numpy as np
+import math
+
+# Optional: TrueSkill library
+try:
+    import trueskill
+    TRUESKILL_AVAILABLE = True
+except ImportError:
+    TRUESKILL_AVAILABLE = False
+
+
+# ============================================================================
+# RATING DATA STRUCTURES
+# ============================================================================
+
+@dataclass
+class Rating:
+    """Container for a rating with metadata"""
+    value: float
+    games_played: int = 0
+    wins: int = 0
+    losses: int = 0
+    ties: int = 0
+    last_updated: Optional[pd.Timestamp] = None
+    
+    @property
+    def win_rate(self) -> float:
+        if self.games_played == 0:
+            return 0.0
+        return self.wins / self.games_played
+    
+    def __repr__(self):
+        return f"Rating({self.value:.1f}, {self.games_played}g, {self.win_rate:.1%} wr)"
+
+
+# ============================================================================
+# BASE RANKING SYSTEM
+# ============================================================================
+
+class RankingSystem(ABC):
+    """Base class for all ranking systems"""
+    
+    def __init__(self):
+        self.rating_history: Dict[str, List[Tuple[pd.Timestamp, float]]] = defaultdict(list)
+    
+    @abstractmethod
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,  # 1.0 if A wins, 0.0 if B wins, 0.5 if tie
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update ratings based on match outcome"""
+        pass
+    
+    @abstractmethod
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get current rating for a strategy"""
+        pass
+    
+    @abstractmethod
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings as dictionary"""
+        pass
+    
+    def get_leaderboard(self, regime: Optional[str] = None, top_n: Optional[int] = None) -> pd.DataFrame:
+        """Get sorted leaderboard"""
+        ratings = self.get_all_ratings(regime)
+        
+        leaderboard = []
+        for name, rating in ratings.items():
+            leaderboard.append({
+                'strategy': name,
+                'rating': rating.value,
+                'games': rating.games_played,
+                'wins': rating.wins,
+                'losses': rating.losses,
+                'ties': rating.ties,
+                'win_rate': rating.win_rate
+            })
+        
+        df = pd.DataFrame(leaderboard)
+        if not df.empty:
+            df = df.sort_values('rating', ascending=False).reset_index(drop=True)
+            df.index = df.index + 1  # Start ranking at 1
+            if top_n:
+                df = df.head(top_n)
+        
+        return df
+    
+    def get_rating_history(self, strategy_name: str) -> pd.Series:
+        """Get historical ratings for a strategy"""
+        history = self.rating_history.get(strategy_name, [])
+        if not history:
+            return pd.Series(dtype=float)
+        
+        timestamps, ratings = zip(*history)
+        return pd.Series(ratings, index=timestamps)
+
+
+# ============================================================================
+# ELO RANKING SYSTEM
+# ============================================================================
+
+class ELORanking(RankingSystem):
+    """
+    Classic ELO rating system adapted for trading strategies.
+    Simple, interpretable, battle-tested.
+    """
+    
+    def __init__(self, k_factor: float = 32, initial_rating: float = 1500):
+        """
+        Args:
+            k_factor: Maximum rating change per game (32 is standard)
+            initial_rating: Starting rating for new strategies
+        """
+        super().__init__()
+        self.k_factor = k_factor
+        self.initial_rating = initial_rating
+        
+        # Global ratings
+        self.ratings: Dict[str, Rating] = defaultdict(
+            lambda: Rating(value=initial_rating)
+        )
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, Rating]] = defaultdict(
+            lambda: defaultdict(lambda: Rating(value=initial_rating))
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update ELO ratings based on match outcome"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._elo_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._elo_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                timestamp
+            )
+    
+    def _elo_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, Rating],
+        timestamp: pd.Timestamp
+    ):
+        """Core ELO update logic"""
+        # Get current ratings
+        rating_a = ratings_dict[name_a]
+        rating_b = ratings_dict[name_b]
+        
+        # Calculate expected scores
+        expected_a = self._expected_score(rating_a.value, rating_b.value)
+        expected_b = 1 - expected_a
+        
+        # Update ratings
+        rating_a.value += self.k_factor * (outcome - expected_a)
+        rating_b.value += self.k_factor * ((1 - outcome) - expected_b)
+        
+        # Update game counts
+        rating_a.games_played += 1
+        rating_b.games_played += 1
+        
+        if outcome == 1.0:
+            rating_a.wins += 1
+            rating_b.losses += 1
+        elif outcome == 0.0:
+            rating_a.losses += 1
+            rating_b.wins += 1
+        else:
+            rating_a.ties += 1
+            rating_b.ties += 1
+        
+        # Update timestamps
+        rating_a.last_updated = timestamp
+        rating_b.last_updated = timestamp
+        
+        # Store history
+        self.rating_history[name_a].append((timestamp, rating_a.value))
+        self.rating_history[name_b].append((timestamp, rating_b.value))
+    
+    def _expected_score(self, rating_a: float, rating_b: float) -> float:
+        """Calculate expected score for player A"""
+        return 1 / (1 + 10 ** ((rating_b - rating_a) / 400))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get current rating"""
+        if regime is None:
+            return self.ratings[strategy_name].value
+        else:
+            return self.regime_ratings[regime][strategy_name].value
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings"""
+        if regime is None:
+            return dict(self.ratings)
+        else:
+            return dict(self.regime_ratings[regime])
+
+
+# ============================================================================
+# TRUESKILL RANKING SYSTEM
+# ============================================================================
+
+class TrueSkillRanking(RankingSystem):
+    """
+    Microsoft's TrueSkill system - more sophisticated than ELO.
+    Tracks both skill (mu) and uncertainty (sigma).
+    Better for handling new strategies and variable skill.
+    """
+    
+    def __init__(
+        self,
+        mu: float = 25.0,
+        sigma: float = 25/3,
+        beta: float = 25/6,
+        tau: float = 25/300,
+        draw_probability: float = 0.1
+    ):
+        """
+        Args:
+            mu: Initial mean skill
+            sigma: Initial skill uncertainty
+            beta: Skill difference for 80% win probability
+            tau: Dynamics factor (skill drift over time)
+            draw_probability: Probability of draws
+        """
+        super().__init__()
+        
+        if not TRUESKILL_AVAILABLE:
+            raise ImportError("TrueSkill not installed. Install with: pip install trueskill")
+        
+        # Configure TrueSkill environment
+        self.env = trueskill.TrueSkill(
+            mu=mu,
+            sigma=sigma,
+            beta=beta,
+            tau=tau,
+            draw_probability=draw_probability
+        )
+        
+        # Global ratings
+        self.ratings: Dict[str, trueskill.Rating] = {}
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, trueskill.Rating]] = defaultdict(dict)
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update TrueSkill ratings"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._trueskill_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._trueskill_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                timestamp
+            )
+    
+    def _trueskill_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, trueskill.Rating],
+        timestamp: pd.Timestamp
+    ):
+        """Core TrueSkill update logic"""
+        # Initialize if needed
+        if name_a not in ratings_dict:
+            ratings_dict[name_a] = self.env.create_rating()
+        if name_b not in ratings_dict:
+            ratings_dict[name_b] = self.env.create_rating()
+        
+        # Determine ranks (lower is better)
+        if outcome == 1.0:  # A wins
+            ranks = [0, 1]
+        elif outcome == 0.0:  # B wins
+            ranks = [1, 0]
+        else:  # Tie
+            ranks = [0, 0]
+        
+        # Update ratings
+        (new_a,), (new_b,) = self.env.rate(
+            [(ratings_dict[name_a],), (ratings_dict[name_b],)],
+            ranks=ranks
+        )
+        
+        ratings_dict[name_a] = new_a
+        ratings_dict[name_b] = new_b
+        
+        # Store history (using conservative rating: mu - 3*sigma)
+        conservative_a = new_a.mu - 3 * new_a.sigma
+        conservative_b = new_b.mu - 3 * new_b.sigma
+        
+        self.rating_history[name_a].append((timestamp, conservative_a))
+        self.rating_history[name_b].append((timestamp, conservative_b))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get conservative rating (mu - 3*sigma)"""
+        if regime is None:
+            rating = self.ratings.get(strategy_name)
+        else:
+            rating = self.regime_ratings[regime].get(strategy_name)
+        
+        if rating is None:
+            return self.env.mu - 3 * self.env.sigma
+        
+        return rating.mu - 3 * rating.sigma
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings with uncertainty info"""
+        if regime is None:
+            ratings_dict = self.ratings
+        else:
+            ratings_dict = self.regime_ratings[regime]
+        
+        result = {}
+        for name, ts_rating in ratings_dict.items():
+            result[name] = Rating(
+                value=ts_rating.mu - 3 * ts_rating.sigma,
+                games_played=0  # TrueSkill doesn't track this directly
+            )
+        
+        return result
+
+
+# ============================================================================
+# BRADLEY-TERRY RANKING SYSTEM
+# ============================================================================
+
+class BradleyTerryRanking(RankingSystem):
+    """
+    Bradley-Terry model: probabilistic paired comparison model.
+    P(A beats B) = strength_A / (strength_A + strength_B)
+    Fitted using maximum likelihood estimation.
+    """
+    
+    def __init__(self, initial_strength: float = 1.0, learning_rate: float = 0.01):
+        """
+        Args:
+            initial_strength: Starting strength for new strategies
+            learning_rate: Step size for gradient updates
+        """
+        super().__init__()
+        self.initial_strength = initial_strength
+        self.learning_rate = learning_rate
+        
+        # Global strengths
+        self.strengths: Dict[str, float] = defaultdict(lambda: initial_strength)
+        self.game_counts: Dict[str, int] = defaultdict(int)
+        
+        # Regime-specific strengths
+        self.regime_strengths: Dict[str, Dict[str, float]] = defaultdict(
+            lambda: defaultdict(lambda: initial_strength)
+        )
+        self.regime_game_counts: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update Bradley-Terry strengths via gradient descent"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global strengths
+        self._bt_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.strengths,
+            self.game_counts,
+            timestamp
+        )
+        
+        # Update regime-specific strengths
+        if regime is not None:
+            self._bt_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_strengths[regime],
+                self.regime_game_counts[regime],
+                timestamp
+            )
+    
+    def _bt_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        strengths_dict: Dict[str, float],
+        counts_dict: Dict[str, int],
+        timestamp: pd.Timestamp
+    ):
+        """Bradley-Terry gradient update"""
+        # Get current strengths
+        s_a = strengths_dict[name_a]
+        s_b = strengths_dict[name_b]
+        
+        # Predicted probability A wins
+        p_a_wins = s_a / (s_a + s_b)
+        
+        # Gradient update
+        error = outcome - p_a_wins
+        
+        strengths_dict[name_a] += self.learning_rate * error * s_b / (s_a + s_b)
+        strengths_dict[name_b] -= self.learning_rate * error * s_a / (s_a + s_b)
+        
+        # Ensure positive
+        strengths_dict[name_a] = max(0.01, strengths_dict[name_a])
+        strengths_dict[name_b] = max(0.01, strengths_dict[name_b])
+        
+        # Update counts
+        counts_dict[name_a] += 1
+        counts_dict[name_b] += 1
+        
+        # Store history (convert to rating-like scale)
+        rating_a = 1500 + 400 * np.log10(strengths_dict[name_a])
+        rating_b = 1500 + 400 * np.log10(strengths_dict[name_b])
+        
+        self.rating_history[name_a].append((timestamp, rating_a))
+        self.rating_history[name_b].append((timestamp, rating_b))
+    
+    def get_rating(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get rating (converted from strength)"""
+        if regime is None:
+            strength = self.strengths[strategy_name]
+        else:
+            strength = self.regime_strengths[regime][strategy_name]
+        
+        # Convert to ELO-like scale
+        return 1500 + 400 * np.log10(strength)
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings"""
+        if regime is None:
+            strengths_dict = self.strengths
+            counts_dict = self.game_counts
+        else:
+            strengths_dict = self.regime_strengths[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        result = {}
+        for name, strength in strengths_dict.items():
+            rating_value = 1500 + 400 * np.log10(strength)
+            result[name] = Rating(
+                value=rating_value,
+                games_played=counts_dict[name]
+            )
+        
+        return result
+
+# ============================================================================
+# BAYESIAN ELO RANKING SYSTEM (NEW)
+# ============================================================================
+
+class BayesianELORanking(RankingSystem):
+    """
+    ELO with Bayesian uncertainty tracking.
+    Each rating has (mu, sigma) where sigma represents confidence.
+    
+    Key differences from standard ELO:
+    - Tracks rating uncertainty (sigma)
+    - K-factor adapts based on uncertainty (higher sigma = faster learning)
+    - Can use conservative rating (mu - k*sigma) for risk-averse decisions
+    """
+    
+    def __init__(
+        self,
+        initial_mu: float = 1500,
+        initial_sigma: float = 350,
+        min_sigma: float = 50,
+        tau: float = 1.0,
+        base_k: float = 32
+    ):
+        """
+        Args:
+            initial_mu: Initial rating mean
+            initial_sigma: Initial rating uncertainty (high = very uncertain)
+            min_sigma: Minimum sigma (ratings never become 100% certain)
+            tau: Dynamics factor - how much sigma increases per game (model drift)
+            base_k: Base K-factor (will be scaled by uncertainty)
+        """
+        super().__init__()
+        self.initial_mu = initial_mu
+        self.initial_sigma = initial_sigma
+        self.min_sigma = min_sigma
+        self.tau = tau
+        self.base_k = base_k
+        
+        # Global ratings: {strategy_name: (mu, sigma)}
+        self.ratings: Dict[str, Tuple[float, float]] = defaultdict(
+            lambda: (initial_mu, initial_sigma)
+        )
+        self.game_counts: Dict[str, int] = defaultdict(int)
+        
+        # Regime-specific ratings
+        self.regime_ratings: Dict[str, Dict[str, Tuple[float, float]]] = defaultdict(
+            lambda: defaultdict(lambda: (initial_mu, initial_sigma))
+        )
+        self.regime_game_counts: Dict[str, Dict[str, int]] = defaultdict(
+            lambda: defaultdict(int)
+        )
+    
+    def update_ratings(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update Bayesian ELO ratings"""
+        timestamp = timestamp or pd.Timestamp.now()
+        
+        # Update global ratings
+        self._bayesian_elo_update(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            self.ratings,
+            self.game_counts,
+            timestamp
+        )
+        
+        # Update regime-specific ratings
+        if regime is not None:
+            self._bayesian_elo_update(
+                strategy_a_name,
+                strategy_b_name,
+                outcome,
+                self.regime_ratings[regime],
+                self.regime_game_counts[regime],
+                timestamp
+            )
+    
+    def _bayesian_elo_update(
+        self,
+        name_a: str,
+        name_b: str,
+        outcome: float,
+        ratings_dict: Dict[str, Tuple[float, float]],
+        counts_dict: Dict[str, int],
+        timestamp: pd.Timestamp
+    ):
+        """Core Bayesian ELO update with uncertainty"""
+        # Get current ratings (mu, sigma)
+        mu_a, sigma_a = ratings_dict[name_a]
+        mu_b, sigma_b = ratings_dict[name_b]
+        
+        # Expected score (standard ELO formula using mu)
+        expected_a = 1 / (1 + 10 ** ((mu_b - mu_a) / 400))
+        
+        # Adaptive K-factor based on uncertainty
+        # Higher uncertainty = faster learning (higher K)
+        # This is the key Bayesian component
+        uncertainty_factor_a = sigma_a / self.initial_sigma
+        uncertainty_factor_b = sigma_b / self.initial_sigma
+        avg_uncertainty = (uncertainty_factor_a + uncertainty_factor_b) / 2
+        
+        # Scale K by uncertainty: very uncertain strategies learn faster
+        k_adapted = self.base_k * (0.5 + 1.5 * avg_uncertainty)
+        
+        # Update mu (same as standard ELO but with adaptive K)
+        error = outcome - expected_a
+        mu_a_new = mu_a + k_adapted * error
+        mu_b_new = mu_b - k_adapted * error
+        
+        # Update sigma (uncertainty decreases with more games)
+        # This is the Bayesian learning: we become more confident as we gather data
+        # But add tau to prevent overconfidence (model drift)
+        sigma_a_new = max(
+            self.min_sigma,
+            np.sqrt(sigma_a**2 / (1 + sigma_a**2 / self.initial_sigma**2)) + self.tau
+        )
+        sigma_b_new = max(
+            self.min_sigma,
+            np.sqrt(sigma_b**2 / (1 + sigma_b**2 / self.initial_sigma**2)) + self.tau
+        )
+        
+        # Store updated ratings
+        ratings_dict[name_a] = (mu_a_new, sigma_a_new)
+        ratings_dict[name_b] = (mu_b_new, sigma_b_new)
+        
+        # Update counts
+        counts_dict[name_a] = counts_dict.get(name_a, 0) + 1
+        counts_dict[name_b] = counts_dict.get(name_b, 0) + 1
+        
+        # Store history (using mu for plotting)
+        self.rating_history[name_a].append((timestamp, mu_a_new))
+        self.rating_history[name_b].append((timestamp, mu_b_new))
+    
+    def get_rating(
+        self,
+        strategy_name: str,
+        regime: Optional[str] = None,
+        conservative: bool = False,
+        conservative_factor: float = 2.0
+    ) -> float:
+        """
+        Get rating for a strategy.
+        
+        Args:
+            strategy_name: Name of strategy
+            regime: Regime (None = global)
+            conservative: If True, return mu - k*sigma (penalize uncertainty)
+            conservative_factor: How many standard deviations to subtract
+        """
+        if regime is None:
+            mu, sigma = self.ratings[strategy_name]
+        else:
+            mu, sigma = self.regime_ratings[regime][strategy_name]
+        
+        if conservative:
+            # Conservative rating: penalize uncertainty
+            # This is useful for risk-averse allocation decisions
+            return mu - conservative_factor * sigma
+        else:
+            return mu
+    
+    def get_uncertainty(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get rating uncertainty (sigma) for a strategy"""
+        if regime is None:
+            _, sigma = self.ratings[strategy_name]
+        else:
+            _, sigma = self.regime_ratings[regime][strategy_name]
+        return sigma
+    
+    def get_signal_to_noise(self, strategy_name: str, regime: Optional[str] = None) -> float:
+        """Get signal-to-noise ratio (mu/sigma) - higher is more reliable"""
+        if regime is None:
+            mu, sigma = self.ratings[strategy_name]
+        else:
+            mu, sigma = self.regime_ratings[regime][strategy_name]
+        
+        return mu / sigma if sigma > 0 else 0
+    
+    def get_all_ratings(self, regime: Optional[str] = None) -> Dict[str, Rating]:
+        """Get all ratings as Rating objects"""
+        if regime is None:
+            ratings_dict = self.ratings
+            counts_dict = self.game_counts
+        else:
+            ratings_dict = self.regime_ratings[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        result = {}
+        for name, (mu, sigma) in ratings_dict.items():
+            result[name] = Rating(
+                value=mu,  # Use mu as the primary rating
+                games_played=counts_dict.get(name, 0)
+            )
+        
+        return result
+    
+    def get_leaderboard_with_uncertainty(
+        self,
+        regime: Optional[str] = None,
+        top_n: Optional[int] = None,
+        sort_by: str = 'mu'  # 'mu', 'conservative', or 'signal_to_noise'
+    ) -> pd.DataFrame:
+        """
+        Get leaderboard with uncertainty information.
+        
+        Args:
+            regime: Which regime
+            top_n: Limit to top N
+            sort_by: How to rank ('mu', 'conservative', 'signal_to_noise')
+        """
+        if regime is None:
+            ratings_dict = self.ratings
+            counts_dict = self.game_counts
+        else:
+            ratings_dict = self.regime_ratings[regime]
+            counts_dict = self.regime_game_counts[regime]
+        
+        leaderboard = []
+        for name, (mu, sigma) in ratings_dict.items():
+            conservative = mu - 2.0 * sigma
+            snr = mu / sigma if sigma > 0 else 0
+            
+            leaderboard.append({
+                'strategy': name,
+                'mu': mu,
+                'sigma': sigma,
+                'conservative_rating': conservative,
+                'signal_to_noise': snr,
+                'games': counts_dict.get(name, 0)
+            })
+        
+        df = pd.DataFrame(leaderboard)
+        if not df.empty:
+            df = df.sort_values(sort_by, ascending=False).reset_index(drop=True)
+            df.index = df.index + 1
+            if top_n:
+                df = df.head(top_n)
+        
+        return df
+
+# ============================================================================
+# MULTI-METRIC RANKING MANAGER
+# ============================================================================
+
+class RankingManager:
+    """
+    Manages multiple ranking systems across metrics and regimes.
+    This is the main interface for the engine.
+    """
+    
+    def __init__(self, ranking_class=ELORanking, **ranking_kwargs):
+        """
+        Args:
+            ranking_class: Which ranking system to use (ELO, TrueSkill, etc.)
+            **ranking_kwargs: Arguments for the ranking system
+        """
+        self.ranking_class = ranking_class
+        self.ranking_kwargs = ranking_kwargs
+        
+        # Structure: rankings[metric][regime] = RankingSystem
+        self.rankings: Dict[str, Dict[Optional[str], RankingSystem]] = defaultdict(dict)
+        
+        # Track which metrics and regimes we've seen
+        self.metrics: set = set()
+        self.regimes: set = set()
+    
+    def update(
+        self,
+        strategy_a_name: str,
+        strategy_b_name: str,
+        outcome: float,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None,
+        timestamp: Optional[pd.Timestamp] = None
+    ):
+        """Update rankings for a specific metric and regime"""
+        # Ensure ranking system exists
+        if regime not in self.rankings[metric]:
+            self.rankings[metric][regime] = self.ranking_class(**self.ranking_kwargs)
+        
+        # Track metrics and regimes
+        self.metrics.add(metric)
+        if regime is not None:
+            self.regimes.add(regime)
+        
+        # Update
+        self.rankings[metric][regime].update_ratings(
+            strategy_a_name,
+            strategy_b_name,
+            outcome,
+            regime,
+            timestamp
+        )
+    
+    def get_leaderboard(
+        self,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None,
+        top_n: Optional[int] = None
+    ) -> pd.DataFrame:
+        """Get leaderboard for specific metric and regime"""
+        if metric not in self.rankings or regime not in self.rankings[metric]:
+            return pd.DataFrame()
+        
+        return self.rankings[metric][regime].get_leaderboard(regime, top_n)
+    
+    def get_all_leaderboards(self) -> Dict[str, Dict[Optional[str], pd.DataFrame]]:
+        """Get all leaderboards across metrics and regimes"""
+        result = {}
+        for metric in self.metrics:
+            result[metric] = {}
+            for regime in [None] + list(self.regimes):
+                if regime in self.rankings[metric]:
+                    result[metric][regime] = self.get_leaderboard(metric, regime)
+        return result
+    
+    def get_rating_history(
+        self,
+        strategy_name: str,
+        metric: str = 'sharpe',
+        regime: Optional[str] = None
+    ) -> pd.Series:
+        """Get rating history for a strategy"""
+        if metric in self.rankings and regime in self.rankings[metric]:
+            return self.rankings[metric][regime].get_rating_history(strategy_name)
+        return pd.Series(dtype=float)
+
+
+# ============================================================================
+# EXAMPLE USAGE
+# ============================================================================
+
+if __name__ == "__main__":
+    print("="*60)
+    print("Ranking System v1 - Example Usage")
+    print("="*60)
+    
+    # Test ELO
+    print("\n" + "-"*60)
+    print("1. ELO Ranking System")
+    print("-"*60)
+    
+    elo = ELORanking(k_factor=32, initial_rating=1500)
+    
+    # Simulate some matches
+    matches = [
+        ("StrategyA", "StrategyB", 1.0, "high_vol"),
+        ("StrategyA", "StrategyC", 0.5, "high_vol"),
+        ("StrategyB", "StrategyC", 0.0, "high_vol"),
+        ("StrategyA", "StrategyB", 0.0, "low_vol"),
+        ("StrategyC", "StrategyB", 1.0, "low_vol"),
+    ]
+    
+    for strat_a, strat_b, outcome, regime in matches:
+        elo.update_ratings(strat_a, strat_b, outcome, regime)
+    
+    print("\nGlobal Leaderboard:")
+    print(elo.get_leaderboard())
+    
+    print("\nHigh Vol Regime Leaderboard:")
+    print(elo.get_leaderboard(regime="high_vol"))
+    
+    print("\nLow Vol Regime Leaderboard:")
+    print(elo.get_leaderboard(regime="low_vol"))
+    
+    # Test Ranking Manager
+    print("\n" + "-"*60)
+    print("2. Ranking Manager (Multi-Metric)")
+    print("-"*60)
+    
+    manager = RankingManager(ranking_class=ELORanking, k_factor=32)
+    
+    # Update different metrics
+    manager.update("StratA", "StratB", 1.0, metric='sharpe', regime='high_vol')
+    manager.update("StratA", "StratB", 0.0, metric='returns', regime='high_vol')
+    manager.update("StratA", "StratC", 1.0, metric='sharpe', regime='low_vol')
+    
+    print("\nSharpe Leaderboard (High Vol):")
+    print(manager.get_leaderboard('sharpe', 'high_vol'))
+    
+    print("\nReturns Leaderboard (High Vol):")
+    print(manager.get_leaderboard('returns', 'high_vol'))
+    
+    print("\n" + "="*60)
+    print("Ranking System Complete!")
+    print("="*60)
+

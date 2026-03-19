@@ -1,0 +1,17 @@
+# Core data manipulation and scientific computing
+pandas
+numpy
+scipy
+yfinance
+scikit-learn
+alpaca-trade-api
+trueskill
+hmmlearn
+pyarrow
+fastparquet
+statsmodels
+ruptures
+matplotlib
+seaborn
+pomegranate
+arch

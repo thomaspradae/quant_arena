@@ -1,0 +1,12 @@
+# environments
+venv/
+
+# python cache
+__pycache__/
+
+# large datasets
+*.parquet
+*.csv
+
+# optional: keep small csv if needed later
+# !small_file.csv

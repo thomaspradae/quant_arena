@@ -1,0 +1,238 @@
+    (venv) [t@gashadokuro arena]$ /home/t/Downloads/arena/venv/bin/python /home/t/Downloads/arena/regime5.py
+
+    RIGOROUS REGIME DETECTION (fixed version)
+
+    Fetching data...
+    Fetched 7045 rows for SPY
+    Building features...
+    Built 34 features; 6982 rows after dropna
+    Selecting stable features (train_end_date = 2010-12-31)...
+    Selected features: ['log_ret', 'signed_abs_ret', 'ret', 'abs_ret', 'vol_ma_ratio_21', 'vol_ma_ratio_63', 'ma_ret_5', 'vwret_5', 'ma_ret_10', 'mom_21', 'ma_ret_21', 'trend_42', 'trend_63', 'trend_21', 'kurt_21']
+
+    Walking forward...
+    ================================================================================
+    PERIOD 1: Train 1997-01-01 -> 2010-12-31 ; Test 2011-01-01 -> 2015-12-31
+    ================================================================================
+    Training HMM (diag cov, multiple restarts)...
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Training GMM...
+    Training KMeans...
+    ================================================================================
+    PERIOD 2: Train 1997-01-01 -> 2015-12-31 ; Test 2016-01-01 -> 2020-12-31
+    ================================================================================
+    Training HMM (diag cov, multiple restarts)...
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Training GMM...
+    Training KMeans...
+    ================================================================================
+    PERIOD 3: Train 1997-01-01 -> 2020-12-31 ; Test 2021-01-01 -> 2024-12-31
+    ================================================================================
+    Training HMM (diag cov, multiple restarts)...
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Even though the 'means_' attribute is set, it will be overwritten during initialization because 'init_params' contains 'm'
+    Training GMM...
+    Training KMeans...
+
+    ------------------------------------------------------------
+    PERIOD_1
+    ------------------------------------------------------------
+
+    HMM:
+    n_regimes_observed: 3
+    mean_duration: 22.1 days
+    transition_rate: 4.45%
+    entropy: 0.793
+    crash_regime (by overlap): 0
+    precision (day-level): 0.000, recall (day-level): 0.000
+    event_recall (window-detection): 0.000, avg_lag (days): None
+
+    GMM:
+    n_regimes_observed: 3
+    mean_duration: 6.2 days
+    transition_rate: 16.14%
+    entropy: 0.722
+    crash_regime (by overlap): 0
+    precision (day-level): 0.000, recall (day-level): 0.000
+    event_recall (window-detection): 0.000, avg_lag (days): None
+
+    KMEANS:
+    n_regimes_observed: 3
+    mean_duration: 15.9 days
+    transition_rate: 6.20%
+    entropy: 0.489
+    crash_regime (by overlap): 0
+    precision (day-level): 0.000, recall (day-level): 0.000
+    event_recall (window-detection): 0.000, avg_lag (days): None
+
+    Inter-method agreement (ARI / NMI):
+    method1 method2      ari      nmi
+        hmm     gmm 0.051302 0.059215
+        hmm  kmeans 0.216002 0.198733
+        gmm  kmeans 0.064486 0.089616
+
+    ------------------------------------------------------------
+    PERIOD_2
+    ------------------------------------------------------------
+
+    HMM:
+    n_regimes_observed: 3
+    mean_duration: 20.0 days
+    transition_rate: 4.92%
+    entropy: 0.885
+    crash_regime (by overlap): 0
+    precision (day-level): 0.236, recall (day-level): 0.960
+    event_recall (window-detection): 0.333, avg_lag (days): 4.0
+
+    GMM:
+    n_regimes_observed: 3
+    mean_duration: 6.5 days
+    transition_rate: 15.41%
+    entropy: 0.767
+    crash_regime (by overlap): 1
+    precision (day-level): 0.303, recall (day-level): 0.600
+    event_recall (window-detection): 0.333, avg_lag (days): 4.0
+
+    KMEANS:
+    n_regimes_observed: 3
+    mean_duration: 24.2 days
+    transition_rate: 4.05%
+    entropy: 0.505
+    crash_regime (by overlap): 0
+    precision (day-level): 0.185, recall (day-level): 0.560
+    event_recall (window-detection): 0.333, avg_lag (days): 1.0
+
+    Inter-method agreement (ARI / NMI):
+    method1 method2      ari      nmi
+        hmm     gmm 0.063552 0.105841
+        hmm  kmeans 0.262479 0.215926
+        gmm  kmeans 0.124669 0.151040
+
+    ------------------------------------------------------------
+    PERIOD_3
+    ------------------------------------------------------------
+
+    HMM:
+    n_regimes_observed: 3
+    mean_duration: 20.1 days
+    transition_rate: 4.88%
+    entropy: 0.824
+    crash_regime (by overlap): 0
+    precision (day-level): 0.554, recall (day-level): 0.196
+    event_recall (window-detection): 0.333, avg_lag (days): 123.0
+
+    GMM:
+    n_regimes_observed: 3
+    mean_duration: 5.9 days
+    transition_rate: 16.83%
+    entropy: 0.796
+    crash_regime (by overlap): 2
+    precision (day-level): 0.780, recall (day-level): 0.220
+    event_recall (window-detection): 0.333, avg_lag (days): 27.0
+
+    KMEANS:
+    n_regimes_observed: 3
+    mean_duration: 15.9 days
+    transition_rate: 6.18%
+    entropy: 0.618
+    crash_regime (by overlap): 1
+    precision (day-level): 0.642, recall (day-level): 0.206
+    event_recall (window-detection): 0.333, avg_lag (days): 27.0
+
+    Inter-method agreement (ARI / NMI):
+    method1 method2      ari      nmi
+        hmm     gmm 0.104582 0.128214
+        hmm  kmeans 0.153787 0.221758
+        gmm  kmeans 0.124702 0.143185
+
+    Aggregated metrics across periods:
+        mean_duration           transition_rate             entropy           crash_precision           crash_recall           event_recall         
+                    mean       std            mean       std      mean       std            mean       std         mean       std         mean      std
+    method                                                                                                                                             
+    gmm         6.176320  0.275391        0.161261  0.007119  0.761688  0.037311        0.360897  0.393038     0.273365  0.303526     0.222222  0.19245
+    hmm        20.711434  1.177680        0.047522  0.002613  0.833983  0.046736        0.263502  0.278016     0.385391  0.507201     0.222222  0.19245
+    kmeans     18.690699  4.781191        0.054755  0.012338  0.537316  0.070726        0.275741  0.330289     0.255247  0.283263     0.222222  0.19245
+
+    Optional: WKMeans benchmark (requires wkmeans package).
+    WKMeans not installed — skip.
+
+    All outputs saved in rigorous_regime_results
+    Completed.
+    (venv) [t@gashadokuro arena]$ /home/t/Downloads/arena/venv/bin/python /home/t/Downloads/arena/regimes_final.py
+    FETCHING DATA...
+    Initial raw columns from yfinance: [('Adj Close', 'SPY'), ('Close', 'SPY'), ('High', 'SPY'), ('Low', 'SPY'), ('Open', 'SPY'), ('Volume', 'SPY')]
+    Fetched 7045 rows for SPY
+    Building features (robust)...
+    Features built: ['log_ret', 'ret', 'abs_ret', 'ma_r_3', 'ma_r_5', 'ma_r_7', 'ma_r_10', 'ma_r_21'] ... total: 23
+
+    --- FEATURE SET: raw_small size= 3
+    Running HMM selection (this can take a bit)...
+    Top HMM models by BIC for feature set raw_small
+    n_states  cov           ll  k            bic
+            4 full 66145.045796 51 -131838.256813
+            3 full 56094.448804 35 -111878.814916
+            2 full 48078.943997 21  -95971.838379
+            4 tied  7547.691191 33  -14803.018701
+            3 tied  4286.162101 23   -8368.555575
+
+    --- FEATURE SET: multi_scale size= 8
+    Running HMM selection (this can take a bit)...
+    Model is not converging.  Current: -21832.612550121547 is not greater than -21832.00456485912. Delta is -0.6079852624279738
+    Model is not converging.  Current: -17388.798110379736 is not greater than -17388.73877427304. Delta is -0.05933610669671907
+    Top HMM models by BIC for feature set multi_scale
+    n_states  cov            ll   k           bic
+            4 full -15724.447286 191  33141.060120
+            3 full -18512.219874 140  38264.770516
+            4 diag -54775.989808  79 110251.880548
+            2 full -57684.221344  91 116174.657686
+            3 diag -58082.921424  56 116661.975155
+
+    --- FEATURE SET: full size= 23
+    Running HMM selection (this can take a bit)...
+    Model is not converging.  Current: -29619.299944049304 is not greater than 8731.689255064139. Delta is -38350.98919911344
+    ...
+    Model is not converging.  Current: 13414.581271960773 is not greater than 85101.35942032. Delta is -71686.77814835923
+
+    Diagnostics (OOS):
+    Regimes: [0 1 2 3]
+    Transition counts:
+    [[1107   55   41   64]
+    [  52 1361   64   74]
+    [  42   63  925   44]
+    [  66   72   45  853]]
+    Transition probabilities:
+    [[0.87371744 0.04340963 0.03235991 0.05051302]
+    [0.03352676 0.87749839 0.0412637  0.04771115]
+    [0.03910615 0.05865922 0.86126629 0.04096834]
+    [0.06370656 0.06949807 0.04343629 0.82335907]]
+    Regime duration sample stats:
+            count       mean        std  min  25%  50%    75%    max
+    regime                                                          
+    0       160.0  11.381250  16.143956  1.0  1.0  4.0  14.25   86.0
+    1       190.0  11.815789  17.838273  1.0  1.0  4.0  13.75  117.0
+    2       150.0  10.433333  12.549187  1.0  1.0  3.0  17.75   59.0
+    3       183.0   8.311475  10.831184  1.0  1.0  3.0  12.00   56.0
+    Selected crash_regime: 3 avg return: -0.00166141594168109
+    Crash detection (OOS) precision=0.125, recall=0.190
+
+    All outputs saved in regime_out
+    Completed.

@@ -1,0 +1,11 @@
+{
+  "analysis_date": "2025-10-14T18:33:21.907108",
+  "historical_moments_analyzed": 8,
+  "crash_days_analyzed": 15,
+  "regimes_analyzed": 2,
+  "strategies_analyzed": 9,
+  "key_findings": [
+    "Most variable ELO rankings: {'MeanReversion_20d': 106.28001722443508, 'TrendFollow_50d': 64.29849814320932, 'RSI_14': 58.66935229146674}",
+    "Most regime-dependent strategy: MeanReversion_20d (diff: 324.4%)"
+  ]
+}

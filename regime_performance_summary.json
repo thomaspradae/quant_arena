@@ -1,0 +1,97 @@
+{
+  "analysis_date": "2025-10-14T19:06:34.205398",
+  "historical_moments_analyzed": 8,
+  "worst_days_analyzed": 15,
+  "volatility_regimes_analyzed": 2,
+  "strategies_analyzed": 9,
+  "regime_performance": {
+    "regime_0": {
+      "best_strategy": "BuyAndHold",
+      "best_return": 2.4918750869404604,
+      "market_volatility": 0.1647758495562228
+    },
+    "regime_1": {
+      "best_strategy": "BuyAndHold",
+      "best_return": 2.667584083654831,
+      "market_volatility": 0.27879052074676625
+    }
+  },
+  "strategy_regime_variability": {
+    "BuyAndHold": {
+      "return_std": 0.08785449835718517,
+      "return_range": 0.17570899671437035,
+      "regime_returns": [
+        2.4918750869404604,
+        2.667584083654831
+      ]
+    },
+    "TrendFollow_50d": {
+      "return_std": 0.09770873189836105,
+      "return_range": 0.1954174637967221,
+      "regime_returns": [
+        0.15782600821211656,
+        0.35324347200883865
+      ]
+    },
+    "MeanReversion_20d": {
+      "return_std": 0.11696383821712301,
+      "return_range": 0.23392767643424606,
+      "regime_returns": [
+        -0.9138457654908252,
+        -0.6799180890565791
+      ]
+    },
+    "LowVol_20d": {
+      "return_std": 0.2484469042765205,
+      "return_range": 0.496893808553041,
+      "regime_returns": [
+        1.2150537397174248,
+        1.7119475482704658
+      ]
+    },
+    "VolBreakout_20d": {
+      "return_std": 0.23577587633042807,
+      "return_range": 0.47155175266085614,
+      "regime_returns": [
+        -0.7461733698976925,
+        -1.2177251225585486
+      ]
+    },
+    "FadeExtremes_63d": {
+      "return_std": 0.2586346097810848,
+      "return_range": 0.5172692195621696,
+      "regime_returns": [
+        -0.09740834495999506,
+        0.4198608746021746
+      ]
+    },
+    "MomXover_20_50": {
+      "return_std": 0.08131198570914466,
+      "return_range": 0.16262397141828933,
+      "regime_returns": [
+        1.5541993441007786,
+        1.3915753726824893
+      ]
+    },
+    "RSI_14": {
+      "return_std": 0.10181425277034883,
+      "return_range": 0.20362850554069767,
+      "regime_returns": [
+        0.5533116094255848,
+        0.3496831038848871
+      ]
+    },
+    "RangeBreak_20d": {
+      "return_std": 0.13913167750746913,
+      "return_range": 0.27826335501493826,
+      "regime_returns": [
+        -0.07765270452421391,
+        -0.3559160595391522
+      ]
+    }
+  },
+  "key_findings": [
+    "Most regime-dependent strategy: FadeExtremes_63d (std=0.259)",
+    "ELO vs Return discrepancy: ['MeanReversion_20d'] rank high in ELO but low in long-term returns"
+  ]
+}
